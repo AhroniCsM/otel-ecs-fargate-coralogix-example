@@ -31,8 +31,11 @@ run "5. Confirm the ECS resource attributes the collector added" \
   spans "filter \$l.applicationName == '$APP' | choose \$d.process.tags['cloud.platform'] as platform, \$d.process.tags['aws.ecs.cluster.arn'] as cluster, \$d.process.tags['host.arch'] as arch | limit 2" \
   --start "$WINDOW" -o agents
 
-run "6. Logs carry the same GUID (log -> trace pivot)" \
-  logs "filter \$l.applicationname == '$APP' | choose \$l.subsystemname, \$d.body, \$d.trace_id | limit 5" \
+# NOTE: Coralogix flattens dots in LOG attribute keys, so the span attribute
+# `hub.message_id` is queried as `hub_message_id` on the logs side. On SPANS the
+# dotted form works ($d.tags['hub.message_id']).
+run "6. Logs carry the same GUID + trace id (log -> trace pivot)" \
+  logs "filter \$l.applicationname == '$APP' && \$d.attributes['hub_message_id'] != null | choose \$l.subsystemname as svc, \$d.attributes['hub_message_id'] as hub_message_id, \$d.attributes['otelTraceID'] as trace_id, \$d.body as body | limit 5" \
   --start "$WINDOW" -o agents
 
 echo

@@ -326,6 +326,29 @@ Everything you need to change is marked `CUSTOMER:` in the source. The short lis
    `OTEL_EXPORTER_OTLP_ENDPOINT` at the EC2 private IP
    (`ECS_CONTAINER_METADATA` / `169.254.169.254`) instead of `localhost`.
 
+## Two ECS gotchas this repo already solves for you
+
+Both cost real debugging time, and neither produces a useful error message.
+
+**1. `networkMode: host` + the default deployment config = a deploy that hangs forever.**
+ECS defaults to `minimumHealthyPercent: 100` / `maximumPercent: 200`, i.e. start
+the new task *before* stopping the old one. With host networking the new task
+cannot bind the port and you get:
+
+```
+ERROR: [Errno 98] error while attempting to bind on address ('0.0.0.0', 8081): address already in use
+```
+
+...on repeat, with `rolloutState: IN_PROGRESS` stuck indefinitely. The services
+here set `0` / `100` so ECS stops the old task first.
+
+**2. `AvailabilityZoneRebalancing` must be `DISABLED` when `maximumPercent <= 100`.**
+ECS enables it by default on new services and then rejects the combination:
+
+> `Availability Zone Rebalancing does not support maximumPercent <= 100 % as deployment configuration`
+
+Set explicitly on every service in the template.
+
 ## Known limitations
 
 - **Node `console.log` is not shipped over OTLP.** OpenTelemetry Node only
@@ -341,4 +364,10 @@ Everything you need to change is marked `CUSTOMER:` in the source. The short lis
   attribute directly for .NET and parses the body for Python.
 - **The Postgres container is ephemeral** (`PGDATA=/tmp/pgdata`). Restarting the
   task loses the data. That is intentional — it is a stand-in for RDS.
-- **First spans take ~2–4 minutes** to become queryable after deploy.
+- **Coralogix flattens dots in LOG attribute keys.** The span attribute
+  `hub.message_id` is queryable as `$d.tags['hub.message_id']` on spans but as
+  `$d.attributes['hub_message_id']` on logs. Caught us mid-verification.
+- **First spans take ~2–4 minutes** to become queryable after deploy. An empty
+  result right after deploying is almost always ingestion lag, not a broken
+  pipeline — check `otelcol_exporter_sent_spans` on the collector's `:8888`
+  metrics endpoint to confirm data is leaving the host.

@@ -214,6 +214,20 @@ Resources:
       Cluster: !Ref Cluster
       TaskDefinition: !Ref PostgresTaskDef
       DesiredCount: 1
+      # Must be DISABLED whenever MaximumPercent <= 100 (ECS rejects the
+      # combination). We only run one instance in one AZ, so rebalancing has
+      # nothing to do anyway.
+      AvailabilityZoneRebalancing: DISABLED
+      DeploymentConfiguration:
+        # CRITICAL FOR networkMode: host.
+        # ECS defaults to MinimumHealthyPercent=100 / MaximumPercent=200, i.e.
+        # start the new task BEFORE stopping the old one. With host networking
+        # the new task then fails with "address already in use" and the
+        # deployment hangs forever. 0/100 = stop the old task first.
+        # (Fine for a POC. If you need zero-downtime rollouts, move the
+        # applications to awsvpc or bridge networking with dynamic host ports.)
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
       LaunchType: EC2
 
   # ===========================================================================
@@ -273,6 +287,20 @@ Resources:
       Cluster: !Ref Cluster
       TaskDefinition: !Ref EdgeDotnetTaskDef
       DesiredCount: 1
+      # Must be DISABLED whenever MaximumPercent <= 100 (ECS rejects the
+      # combination). We only run one instance in one AZ, so rebalancing has
+      # nothing to do anyway.
+      AvailabilityZoneRebalancing: DISABLED
+      DeploymentConfiguration:
+        # CRITICAL FOR networkMode: host.
+        # ECS defaults to MinimumHealthyPercent=100 / MaximumPercent=200, i.e.
+        # start the new task BEFORE stopping the old one. With host networking
+        # the new task then fails with "address already in use" and the
+        # deployment hangs forever. 0/100 = stop the old task first.
+        # (Fine for a POC. If you need zero-downtime rollouts, move the
+        # applications to awsvpc or bridge networking with dynamic host ports.)
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
       LaunchType: EC2
 
   # ===========================================================================
@@ -342,6 +370,20 @@ Resources:
       Cluster: !Ref Cluster
       TaskDefinition: !Ref HubPythonTaskDef
       DesiredCount: 1
+      # Must be DISABLED whenever MaximumPercent <= 100 (ECS rejects the
+      # combination). We only run one instance in one AZ, so rebalancing has
+      # nothing to do anyway.
+      AvailabilityZoneRebalancing: DISABLED
+      DeploymentConfiguration:
+        # CRITICAL FOR networkMode: host.
+        # ECS defaults to MinimumHealthyPercent=100 / MaximumPercent=200, i.e.
+        # start the new task BEFORE stopping the old one. With host networking
+        # the new task then fails with "address already in use" and the
+        # deployment hangs forever. 0/100 = stop the old task first.
+        # (Fine for a POC. If you need zero-downtime rollouts, move the
+        # applications to awsvpc or bridge networking with dynamic host ports.)
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
       LaunchType: EC2
 
   # ===========================================================================
@@ -412,6 +454,20 @@ Resources:
       Cluster: !Ref Cluster
       TaskDefinition: !Ref WorkerNodeTaskDef
       DesiredCount: 1
+      # Must be DISABLED whenever MaximumPercent <= 100 (ECS rejects the
+      # combination). We only run one instance in one AZ, so rebalancing has
+      # nothing to do anyway.
+      AvailabilityZoneRebalancing: DISABLED
+      DeploymentConfiguration:
+        # CRITICAL FOR networkMode: host.
+        # ECS defaults to MinimumHealthyPercent=100 / MaximumPercent=200, i.e.
+        # start the new task BEFORE stopping the old one. With host networking
+        # the new task then fails with "address already in use" and the
+        # deployment hangs forever. 0/100 = stop the old task first.
+        # (Fine for a POC. If you need zero-downtime rollouts, move the
+        # applications to awsvpc or bridge networking with dynamic host ports.)
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
       LaunchType: EC2
 
   # ===========================================================================
@@ -459,6 +515,20 @@ Resources:
       Cluster: !Ref Cluster
       TaskDefinition: !Ref LoadgenTaskDef
       DesiredCount: 1
+      # Must be DISABLED whenever MaximumPercent <= 100 (ECS rejects the
+      # combination). We only run one instance in one AZ, so rebalancing has
+      # nothing to do anyway.
+      AvailabilityZoneRebalancing: DISABLED
+      DeploymentConfiguration:
+        # CRITICAL FOR networkMode: host.
+        # ECS defaults to MinimumHealthyPercent=100 / MaximumPercent=200, i.e.
+        # start the new task BEFORE stopping the old one. With host networking
+        # the new task then fails with "address already in use" and the
+        # deployment hangs forever. 0/100 = stop the old task first.
+        # (Fine for a POC. If you need zero-downtime rollouts, move the
+        # applications to awsvpc or bridge networking with dynamic host ports.)
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
       LaunchType: EC2
 
 Outputs:
