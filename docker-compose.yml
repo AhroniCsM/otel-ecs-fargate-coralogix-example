@@ -28,7 +28,7 @@ x-otel-common: &otel-common
   OTEL_PROPAGATORS: tracecontext,baggage
   # ---- how it shows up in Coralogix --------------------------------------
   #   application = service.namespace   subsystem = service.name
-  OTEL_RESOURCE_ATTRIBUTES: service.namespace=moh-hub-poc,deployment.environment=poc
+  OTEL_RESOURCE_ATTRIBUTES: service.namespace=moh-hub-poc,deployment.environment.name=ecs-stg-exmaple,deployment.environment=ecs-stg-exmaple
 
 services:
 

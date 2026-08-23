@@ -41,6 +41,14 @@ Parameters:
     Default: eu2.coralogix.com
     Description: CUSTOMER - your Coralogix region domain (eu1/eu2/us1/us2/ap1...).
 
+  # CUSTOMER: this is what shows up as the Environment in Coralogix APM, and it
+  # is how you keep stg and prod telemetry apart in one account. Change it per
+  # deployment (ecs-stg-example / ecs-prod / ...).
+  DeploymentEnvironmentName:
+    Type: String
+    Default: ecs-stg-exmaple
+    Description: Value for the deployment.environment.name resource attribute.
+
   CoralogixKeyParameter:
     Type: String
     Default: /moh-hub-otel/coralogix-private-key
@@ -137,7 +145,9 @@ Resources:
         - Name: otel-collector
           Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}/otel-collector:${ImageTag}'
           Essential: true
-          MemoryReservation: 320
+          # 448 MiB: the spanmetrics connector holds an in-memory aggregation of
+          # every service/operation/dimension combination until it flushes.
+          MemoryReservation: 448
           Environment:
             - Name: CORALOGIX_DOMAIN
               Value: !Ref CoralogixDomain
@@ -253,7 +263,11 @@ Resources:
             - Name: OTEL_SERVICE_NAME              # -> Coralogix subsystem
               Value: edge-dotnet
             - Name: OTEL_RESOURCE_ATTRIBUTES       # service.namespace -> Coralogix application
-              Value: service.namespace=moh-hub-poc,deployment.environment=poc
+              # service.namespace       -> Coralogix APPLICATION
+              # deployment.environment.name -> Coralogix ENVIRONMENT
+              #   (`deployment.environment` is the deprecated spelling; we set
+              #    both so older SDKs and tooling still pick it up)
+              Value: !Sub 'service.namespace=moh-hub-poc,deployment.environment.name=${DeploymentEnvironmentName},deployment.environment=${DeploymentEnvironmentName}'
             - Name: OTEL_EXPORTER_OTLP_ENDPOINT    # the DAEMON collector, same host
               Value: http://localhost:4318
             - Name: OTEL_EXPORTER_OTLP_PROTOCOL
@@ -325,7 +339,11 @@ Resources:
             - Name: OTEL_SERVICE_NAME
               Value: hub-python
             - Name: OTEL_RESOURCE_ATTRIBUTES
-              Value: service.namespace=moh-hub-poc,deployment.environment=poc
+              # service.namespace       -> Coralogix APPLICATION
+              # deployment.environment.name -> Coralogix ENVIRONMENT
+              #   (`deployment.environment` is the deprecated spelling; we set
+              #    both so older SDKs and tooling still pick it up)
+              Value: !Sub 'service.namespace=moh-hub-poc,deployment.environment.name=${DeploymentEnvironmentName},deployment.environment=${DeploymentEnvironmentName}'
             - Name: OTEL_EXPORTER_OTLP_ENDPOINT
               Value: http://localhost:4318
             - Name: OTEL_EXPORTER_OTLP_PROTOCOL
@@ -408,7 +426,11 @@ Resources:
             - Name: OTEL_SERVICE_NAME
               Value: worker-node
             - Name: OTEL_RESOURCE_ATTRIBUTES
-              Value: service.namespace=moh-hub-poc,deployment.environment=poc
+              # service.namespace       -> Coralogix APPLICATION
+              # deployment.environment.name -> Coralogix ENVIRONMENT
+              #   (`deployment.environment` is the deprecated spelling; we set
+              #    both so older SDKs and tooling still pick it up)
+              Value: !Sub 'service.namespace=moh-hub-poc,deployment.environment.name=${DeploymentEnvironmentName},deployment.environment=${DeploymentEnvironmentName}'
             - Name: OTEL_EXPORTER_OTLP_ENDPOINT
               Value: http://localhost:4318
             - Name: OTEL_EXPORTER_OTLP_PROTOCOL

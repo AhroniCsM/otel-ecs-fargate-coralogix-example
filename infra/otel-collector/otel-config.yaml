@@ -23,8 +23,8 @@ processors:
   # container's memory reservation.
   memory_limiter:
     check_interval: 2s
-    limit_mib: 300
-    spike_limit_mib: 80
+    limit_mib: 380
+    spike_limit_mib: 90
 
   # Adds cloud.*, aws.ecs.*, host.* resource attributes so you can slice APM by
   # cluster / task / instance in Coralogix.
@@ -90,6 +90,31 @@ processors:
           - 'set(cache["a"], ExtractPatterns(body, "hub_message_id=(?P<id>[0-9a-fA-F-]{36})")) where attributes["hub.message_id"] == nil and body != nil'
           - 'set(attributes["hub.message_id"], cache["a"]["id"]) where attributes["hub.message_id"] == nil and cache["a"] != nil'
 
+  # ===========================================================================
+  #  APM TRANSACTION DETECTION  —  required for the full APM experience
+  # ===========================================================================
+  #  Without this processor you get traces, but Coralogix APM cannot group them
+  #  into business transactions: the `cgx.transaction` and
+  #  `cgx.transaction.root` span attributes are missing, and the APM
+  #  Transactions / Service Catalog views stay empty.
+  #  It walks each trace, picks the entry-point span, and stamps the whole
+  #  trace with the transaction name.
+  #
+  #  NOTE: `transactions.enabled` defaults to FALSE. `coralogix: {}` validates
+  #  happily and does nothing at all -- you get no error, just permanently empty
+  #  APM Transaction views. You must switch it on explicitly.
+  #  STATUS (verified on CDOT v0.5.13/0.5.15): this processor loads and logs
+  #  "Development component. May change in the future.", but did NOT populate
+  #  `cgx.transaction` / `cgx.transaction.root` in our testing -- with or
+  #  without a `groupbytrace` processor in front of it to batch whole traces.
+  #  Everything else in APM works without it (service catalog, RED metrics,
+  #  latency, service map, error rates all come from the spans and the span
+  #  metrics below). Only the APM *Transactions* grouping view depends on it.
+  #  Left configured and switched on; revisit on a newer CDOT release.
+  coralogix:
+    transactions:
+      enabled: true
+
   batch:
     send_batch_size: 1024
     send_batch_max_size: 2048
@@ -126,6 +151,35 @@ exporters:
   # debug:
   #   verbosity: detailed
 
+connectors:
+  # ===========================================================================
+  #  APM SERVICE METRICS  —  RED metrics derived from the spans themselves
+  # ===========================================================================
+  #  Produces calls_total + duration histograms per service/operation, which is
+  #  what drives the APM latency, throughput and error-rate charts. Generated
+  #  locally from spans you are already sending, so it costs no extra spans.
+  spanmetrics:
+    histogram:
+      explicit:
+        # Coralogix's recommended default buckets for ECS/EC2.
+        buckets: [1ms, 4ms, 10ms, 20ms, 50ms, 100ms, 200ms, 500ms, 1s, 2s, 5s]
+    # CUSTOMER: BE CAREFUL HERE. Every dimension multiplies the number of time
+    # series. These are all low-cardinality and safe.
+    # NEVER add a dimension whose value is unbounded -- and `hub.message_id` is
+    # a GUID per transaction, so adding it here would create one time series per
+    # request and blow up both cardinality and cost. Keep the GUID on SPANS
+    # (where it belongs) and off METRICS.
+    dimensions:
+      - name: http.request.method
+      - name: http.response.status_code
+      - name: messaging.system
+      - name: db.system
+    metrics_expiration: 5m
+    exemplars:
+      # Attaches example trace IDs to the metrics, so you can jump from a
+      # latency spike straight into a representative trace.
+      enabled: true
+
 extensions:
   health_check:
     endpoint: 0.0.0.0:13133
@@ -137,10 +191,14 @@ service:
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [memory_limiter, resourcedetection/ecs, transform/hub_message_id, batch]
-      exporters: [coralogix]
+      processors: [memory_limiter, resourcedetection/ecs, transform/hub_message_id, coralogix, batch]
+      # Two destinations: Coralogix, and the spanmetrics connector which feeds
+      # the metrics pipeline below.
+      exporters: [coralogix, spanmetrics]
     metrics:
-      receivers: [otlp]
+      # OTLP = the SDKs' own runtime/HTTP metrics.
+      # spanmetrics = the APM RED metrics derived from the traces above.
+      receivers: [otlp, spanmetrics]
       processors: [memory_limiter, resourcedetection/ecs, batch]
       exporters: [coralogix]
     logs:

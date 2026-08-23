@@ -124,7 +124,7 @@ Set in [`infra/cloudformation/02-ecs.yaml`](infra/cloudformation/02-ecs.yaml):
 
 ```bash
 OTEL_SERVICE_NAME=edge-dotnet                     # → Coralogix SUBSYSTEM
-OTEL_RESOURCE_ATTRIBUTES=service.namespace=moh-hub-poc,deployment.environment=poc
+OTEL_RESOURCE_ATTRIBUTES=service.namespace=moh-hub-poc,deployment.environment.name=ecs-stg-exmaple,deployment.environment=ecs-stg-exmaple
                                                   # service.namespace → Coralogix APPLICATION
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 # the DAEMON collector on the same host
 OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
@@ -325,6 +325,65 @@ Everything you need to change is marked `CUSTOMER:` in the source. The short lis
    the applications, switch them to `awsvpc`/`bridge` and point
    `OTEL_EXPORTER_OTLP_ENDPOINT` at the EC2 private IP
    (`ECS_CONTAINER_METADATA` / `169.254.169.254`) instead of `localhost`.
+
+## Full APM, not just traces
+
+Traces alone do not populate Coralogix APM. Two extra pieces of **collector**
+config (no application change) do:
+
+**1. Span metrics** — the `spanmetrics` connector derives RED metrics from the
+spans you are already sending, which is what drives the APM latency, throughput
+and error-rate charts. Verified live:
+
+```
+$ cx metrics query 'sum by (service_name) (increase(traces_span_metrics_calls_total[10m]))'
+  "edge-dotnet","153"
+  "hub-python","255"
+  "worker-node","949"
+```
+
+The metric family Coralogix receives is:
+
+| Metric | Use |
+|---|---|
+| `traces_span_metrics_calls_total` | throughput + error rate |
+| `traces_span_metrics_duration_ms_bucket` | latency percentiles |
+| `traces_span_metrics_duration_ms_count` / `_sum` | averages |
+
+> **Cost warning, and it matters.** Every `dimensions:` entry multiplies the
+> time-series count. The dimensions here (`http.request.method`,
+> `http.response.status_code`, `messaging.system`, `db.system`) are all
+> low-cardinality. **Never add `hub.message_id`** — it is a GUID per
+> transaction, so it would create one time series per request. Keep the GUID on
+> spans, off metrics.
+
+**2. Environment separation** — `deployment.environment.name` becomes the
+Environment facet in APM, which is how you keep stg and prod apart in one
+account. Set via the `DeploymentEnvironmentName` CloudFormation parameter
+(currently `ecs-stg-exmaple`) and verified arriving:
+
+```
+$ cx spans "... | groupby $d.process.tags['deployment.environment.name'] as env agg count()"
+  "ecs-stg-exmaple",54
+```
+
+### Open item: APM *Transactions* grouping
+
+The `coralogix` processor is what stamps `cgx.transaction` /
+`cgx.transaction.root` onto spans, which powers the APM **Transactions** view.
+
+On CDOT `v0.5.13`/`v0.5.15` it loads and logs *"Development component. May
+change in the future."* but did **not** populate those attributes in our
+testing — neither with `coralogix: {}` nor with `transactions: {enabled: true}`,
+and not with a `groupbytrace` processor in front of it to batch whole traces.
+
+Note `transactions.enabled` defaults to **false**, and `coralogix: {}` validates
+happily while doing nothing — no error, just a permanently empty Transactions
+view. Worth knowing either way.
+
+Everything else in APM works without it: service catalog, service map, RED
+metrics, latency percentiles and error rates all derive from the spans and the
+span metrics above, all of which are verified working.
 
 ## Two ECS gotchas this repo already solves for you
 

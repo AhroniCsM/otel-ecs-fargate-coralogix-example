@@ -7,6 +7,7 @@ set -euo pipefail
 REGION="${AWS_REGION:-eu-north-1}"
 PROJECT="${PROJECT_NAME:-moh-hub-otel}"
 CORALOGIX_DOMAIN="${CORALOGIX_DOMAIN:-eu2.coralogix.com}"
+DEPLOY_ENV="${DEPLOY_ENV:-ecs-stg-exmaple}"   # -> deployment.environment.name
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 : "${CORALOGIX_PRIVATE_KEY:?export CORALOGIX_PRIVATE_KEY=cxtp_... (Send-Your-Data key) first}"
@@ -44,6 +45,7 @@ aws cloudformation deploy --region "$REGION" \
   --parameter-overrides \
       "ProjectName=${PROJECT}" "VpcId=${VPC}" "SubnetId=${SUBNET}" \
       "CoralogixDomain=${CORALOGIX_DOMAIN}" \
+      "DeploymentEnvironmentName=${DEPLOY_ENV}" \
       "CoralogixKeyParameter=/${PROJECT}/coralogix-private-key" \
   --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset
 
