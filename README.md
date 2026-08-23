@@ -282,6 +282,21 @@ docker compose up --build
 
 Same containers, same environment variables, real SQS, real Coralogix.
 
+### Stop / start without destroying
+
+```bash
+./scripts/scale.sh stop      # EC2 instance terminated, cost ~= $0
+./scripts/scale.sh start     # back up, traffic resumes in ~2 minutes
+./scripts/scale.sh status
+```
+
+> **Heads-up if you run this in a Coralogix AWS account.** There is an
+> account-level automation (IAM principal `eks-ecs-auto-scaler`) that scales
+> **every ECS service in the account to `desiredCount: 0`** on a schedule — it
+> hit this lab at 01:00 local time, including the DAEMON collector and services
+> in unrelated clusters. If your demo is mysteriously dead in the morning, that
+> is why. Run `./scripts/scale.sh start` before showing anything to a customer.
+
 ### Tear down
 
 ```bash
