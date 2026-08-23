@@ -1,0 +1,126 @@
+# =============================================================================
+#  LOCAL smoke test — same containers, same env vars, same Coralogix account.
+# =============================================================================
+#  Run this first to see traces in Coralogix in ~2 minutes, before you touch
+#  ECS. It uses your REAL SQS queues, so export AWS credentials first.
+#
+#    export CORALOGIX_PRIVATE_KEY=cxtp_...
+#    export CORALOGIX_DOMAIN=eu2.coralogix.com
+#    export BLUE_QUEUE_URL=https://sqs.eu-north-1.amazonaws.com/<acct>/moh-hub-otel-blue
+#    export GREEN_QUEUE_URL=https://sqs.eu-north-1.amazonaws.com/<acct>/moh-hub-otel-green
+#    docker compose up --build
+#
+#  The env blocks below are IDENTICAL to what the ECS task definitions set --
+#  that is the point. Auto-instrumentation is configured purely by environment.
+# =============================================================================
+
+x-otel-common: &otel-common
+  # ---- where to send telemetry -------------------------------------------
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+  OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+  # ---- what to send -------------------------------------------------------
+  OTEL_TRACES_EXPORTER: otlp
+  OTEL_METRICS_EXPORTER: otlp
+  OTEL_LOGS_EXPORTER: otlp
+  # ---- NO SAMPLING: 100% of traces go to Coralogix ------------------------
+  OTEL_TRACES_SAMPLER: always_on
+  # ---- context propagation across every hop ------------------------------
+  OTEL_PROPAGATORS: tracecontext,baggage
+  # ---- how it shows up in Coralogix --------------------------------------
+  #   application = service.namespace   subsystem = service.name
+  OTEL_RESOURCE_ATTRIBUTES: service.namespace=moh-hub-poc,deployment.environment=poc
+
+services:
+
+  # -------------------------------------------------------------------------
+  #  The Coralogix collector. In ECS this is a DAEMON service on every host.
+  # -------------------------------------------------------------------------
+  otel-collector:
+    build: ./infra/otel-collector
+    environment:
+      CORALOGIX_DOMAIN: ${CORALOGIX_DOMAIN:?set CORALOGIX_DOMAIN}
+      CORALOGIX_PRIVATE_KEY: ${CORALOGIX_PRIVATE_KEY:?set CORALOGIX_PRIVATE_KEY}
+    ports: ['4317:4317', '4318:4318', '13133:13133']
+
+  # -------------------------------------------------------------------------
+  #  Stands in for RDS. Zero-cost replacement for a real RDS instance -- the
+  #  auto-instrumented `db.*` spans look the same either way.
+  #  CUSTOMER: delete this and point PG_DSN/PG_URL at your RDS endpoint.
+  # -------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: hubdemo
+      POSTGRES_USER: hub
+      POSTGRES_DB: hub
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U hub']
+      interval: 5s
+      retries: 20
+
+  # -------------------------------------------------------------------------
+  #  BLUE step 1/5 + GREEN step 5/5  —  ALB + API Gateway (F5)
+  # -------------------------------------------------------------------------
+  edge-dotnet:
+    build: ./services/edge-dotnet
+    depends_on: [otel-collector]
+    environment:
+      <<: *otel-common
+      OTEL_SERVICE_NAME: edge-dotnet
+      HUB_ROUTER_URL: http://hub-python:8081
+    ports: ['8080:8080']
+
+  # -------------------------------------------------------------------------
+  #  BLUE step 2/5 + GREEN step 1/5  —  routing Lambda / RDS-change trigger
+  # -------------------------------------------------------------------------
+  hub-python:
+    build: ./services/hub-python
+    depends_on:
+      otel-collector: { condition: service_started }
+      postgres: { condition: service_healthy }
+    environment:
+      <<: *otel-common
+      OTEL_SERVICE_NAME: hub-python
+      # Attaches trace_id/span_id to every stdlib log record and ships them.
+      OTEL_PYTHON_LOG_CORRELATION: 'true'
+      OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED: 'true'
+      AWS_REGION: ${AWS_REGION:-eu-north-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?set AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?set AWS_SECRET_ACCESS_KEY}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      BLUE_QUEUE_URL: ${BLUE_QUEUE_URL:?set BLUE_QUEUE_URL}
+      PG_DSN: postgresql://hub:hubdemo@postgres:5432/hub
+    ports: ['8081:8081']
+
+  # -------------------------------------------------------------------------
+  #  BLUE step 3+4/5 and ALL of GREEN's queue work  —  the SQS Lambdas
+  # -------------------------------------------------------------------------
+  worker-node:
+    build: ./services/worker-node
+    depends_on:
+      otel-collector: { condition: service_started }
+      postgres: { condition: service_healthy }
+    environment:
+      <<: *otel-common
+      OTEL_SERVICE_NAME: worker-node
+      AWS_REGION: ${AWS_REGION:-eu-north-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?set AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?set AWS_SECRET_ACCESS_KEY}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      BLUE_QUEUE_URL: ${BLUE_QUEUE_URL:?set BLUE_QUEUE_URL}
+      GREEN_QUEUE_URL: ${GREEN_QUEUE_URL:?set GREEN_QUEUE_URL}
+      PG_URL: postgresql://hub:hubdemo@postgres:5432/hub
+      F5_CALLBACK_URL: http://edge-dotnet:8080/f5/clinic-callback
+    ports: ['8082:8082']
+
+  # -------------------------------------------------------------------------
+  #  Always-on traffic. Uninstrumented on purpose (it is "the clinic").
+  # -------------------------------------------------------------------------
+  loadgen:
+    build: ./loadgen
+    depends_on: [edge-dotnet, worker-node]
+    environment:
+      EDGE_URL: http://edge-dotnet:8080
+      GREEN_TRIGGER_URL: http://worker-node:8082
+      INTERVAL: '10'
+      GREEN_EVERY: '3'

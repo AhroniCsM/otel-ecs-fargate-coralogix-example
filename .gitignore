@@ -1,0 +1,13 @@
+# Never commit the Coralogix key or AWS credentials.
+.env
+.env.local
+*.pem
+*.key
+
+# Build output
+bin/
+obj/
+node_modules/
+__pycache__/
+*.pyc
+.DS_Store

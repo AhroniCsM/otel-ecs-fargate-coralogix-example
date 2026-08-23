@@ -1,0 +1,201 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  MoH HUB OTel POC - stack 1/2 (foundation).
+  SQS queues for the BLUE/GREEN flows + DLQ, ECR repositories, ECS IAM roles,
+  and the CloudWatch log group. Everything here is free or well inside free tier.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: moh-hub-otel
+    Description: Prefix for every resource name.
+
+Resources:
+
+  # ===========================================================================
+  #  SQS - the async boundary between the BLUE and the GREEN flow
+  # ===========================================================================
+  # CUSTOMER: these are Standard queues (cheapest, simplest). Your production
+  # HUB uses FIFO. OpenTelemetry context propagation works identically on FIFO -
+  # the W3C `traceparent` travels in a MessageAttribute either way. To switch,
+  # add FifoQueue: true + a .fifo name suffix and pass MessageGroupId on send.
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-dlq'
+      MessageRetentionPeriod: 86400
+
+  BlueQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-blue'
+      # 20s long polling on the consumer keeps us far inside the SQS free tier.
+      ReceiveMessageWaitTimeSeconds: 20
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 3600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  GreenQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-green'
+      ReceiveMessageWaitTimeSeconds: 20
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 3600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  # ===========================================================================
+  #  ECR - one repository per image, pruned to the last 3 tags
+  # ===========================================================================
+  EcrEdgeDotnet:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ProjectName}/edge-dotnet'
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"keep last 3","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":3},"action":{"type":"expire"}}]}'
+
+  EcrHubPython:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ProjectName}/hub-python'
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"keep last 3","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":3},"action":{"type":"expire"}}]}'
+
+  EcrWorkerNode:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ProjectName}/worker-node'
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"keep last 3","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":3},"action":{"type":"expire"}}]}'
+
+  EcrLoadgen:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ProjectName}/loadgen'
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"keep last 3","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":3},"action":{"type":"expire"}}]}'
+
+  EcrOtelCollector:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ProjectName}/otel-collector'
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"keep last 3","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":3},"action":{"type":"expire"}}]}'
+
+  # ===========================================================================
+  #  Logs
+  # ===========================================================================
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}'
+      # Short retention: the real logs live in Coralogix. CloudWatch is only
+      # here so you can debug container startup.
+      RetentionInDays: 3
+
+  # ===========================================================================
+  #  IAM
+  # ===========================================================================
+  # (1) EXECUTION role - used by the ECS agent: pull from ECR, write CloudWatch
+  #     logs, and read the Coralogix key out of SSM Parameter Store.
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-exec'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-coralogix-key
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ssm:GetParameters, ssm:GetParameter]
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/*'
+
+  # (2) TASK role - used by the application code inside the containers.
+  #     Least privilege: only the two queues, nothing else.
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-task'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: sqs-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:GetQueueUrl
+                Resource:
+                  - !GetAtt BlueQueue.Arn
+                  - !GetAtt GreenQueue.Arn
+
+  # (3) EC2 instance role - lets the ECS agent on the instance join the cluster.
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-instance'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        # Lets you SSM into the box for debugging - no SSH key, no port 22.
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ProjectName}-instance'
+      Roles: [!Ref InstanceRole]
+
+Outputs:
+  BlueQueueUrl:
+    Value: !Ref BlueQueue
+    Export: { Name: !Sub '${ProjectName}-blue-queue-url' }
+  GreenQueueUrl:
+    Value: !Ref GreenQueue
+    Export: { Name: !Sub '${ProjectName}-green-queue-url' }
+  EcrRegistry:
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com'
+  ExecutionRoleArn:
+    Value: !GetAtt ExecutionRole.Arn
+    Export: { Name: !Sub '${ProjectName}-exec-role' }
+  TaskRoleArn:
+    Value: !GetAtt TaskRole.Arn
+    Export: { Name: !Sub '${ProjectName}-task-role' }
+  InstanceProfileArn:
+    Value: !GetAtt InstanceProfile.Arn
+    Export: { Name: !Sub '${ProjectName}-instance-profile' }
+  LogGroupName:
+    Value: !Ref LogGroup
+    Export: { Name: !Sub '${ProjectName}-log-group' }

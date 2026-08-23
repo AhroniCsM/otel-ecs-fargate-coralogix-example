@@ -1,0 +1,470 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  MoH HUB OTel POC - stack 2/2 (compute).
+  One ECS-on-EC2 cluster, a single t4g.small instance, and six services: the
+  Coralogix collector (DAEMON), a stand-in RDS, the three auto-instrumented
+  applications, and the always-on traffic generator.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: moh-hub-otel
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Any VPC with outbound internet access (the default VPC is fine).
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: A PUBLIC subnet in that VPC (needs egress to ECR / SQS / Coralogix).
+
+  # CUSTOMER: t4g.small = 2 vCPU / 2 GiB on Graviton - the cheapest instance that
+  # comfortably runs all six containers (~USD 12/month in eu-north-1).
+  # For x86 images use t3.small AND change EcsAmiId below to the x86 SSM path.
+  InstanceType:
+    Type: String
+    Default: t4g.small
+
+  EcsAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id
+    Description: >
+      ECS-optimized AMI. arm64 path shown. For x86 use
+      /aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id
+
+  ImageTag:
+    Type: String
+    Default: latest
+
+  CoralogixDomain:
+    Type: String
+    Default: eu2.coralogix.com
+    Description: CUSTOMER - your Coralogix region domain (eu1/eu2/us1/us2/ap1...).
+
+  CoralogixKeyParameter:
+    Type: String
+    Default: /moh-hub-otel/coralogix-private-key
+    Description: >
+      Name of the SSM Parameter Store SecureString holding your Coralogix
+      Send-Your-Data API key. The key itself is never in this template or in git.
+
+Resources:
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref ProjectName
+      ClusterSettings:
+        # Disabled = no extra CloudWatch charges. All telemetry goes to Coralogix.
+        - Name: containerInsights
+          Value: disabled
+
+  # ===========================================================================
+  #  Networking
+  # ===========================================================================
+  # NOTE: there are NO inbound rules at all. Every task uses networkMode=host,
+  # so all service-to-service traffic is localhost and never leaves the box.
+  # Nothing needs to be reachable from outside. Use SSM Session Manager (already
+  # allowed by the instance role) if you need a shell - no SSH key, no port 22.
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${ProjectName} ECS instance - egress only'
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: ECR, SQS, SSM and Coralogix ingress
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${ProjectName}-lt'
+      LaunchTemplateData:
+        ImageId: !Ref EcsAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !ImportValue
+            Fn::Sub: '${ProjectName}-instance-profile'
+        SecurityGroupIds: [!Ref InstanceSecurityGroup]
+        MetadataOptions:
+          HttpTokens: required          # IMDSv2 only
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 30
+              VolumeType: gp3
+              DeleteOnTermination: true
+              Encrypted: true
+        # This one line is all it takes to join the ECS cluster.
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            echo "ECS_CLUSTER=${ProjectName}" >> /etc/ecs/ecs.config
+            echo "ECS_ENABLE_CONTAINER_METADATA=true" >> /etc/ecs/ecs.config
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${ProjectName}-asg'
+      MinSize: '1'
+      MaxSize: '1'
+      DesiredCapacity: '1'
+      VPCZoneIdentifier: [!Ref SubnetId]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ecs'
+          PropagateAtLaunch: true
+
+  # ===========================================================================
+  #  TASK DEFINITION 1 - the Coralogix collector (runs as a DAEMON)
+  # ===========================================================================
+  #  networkMode: host means every application container reaches it at
+  #  http://localhost:4318 - no service discovery, no sidecars, one collector
+  #  per EC2 instance. This is the pattern in the Coralogix ECS-EC2 docs.
+  CollectorTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-otel-collector'
+      NetworkMode: host
+      RequiresCompatibilities: [EC2]
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: '${ProjectName}-exec-role'
+      ContainerDefinitions:
+        - Name: otel-collector
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}/otel-collector:${ImageTag}'
+          Essential: true
+          MemoryReservation: 320
+          Environment:
+            - Name: CORALOGIX_DOMAIN
+              Value: !Ref CoralogixDomain
+          Secrets:
+            # Pulled from SSM Parameter Store by the ECS agent at start time.
+            # The value never appears in the task definition or in CloudTrail.
+            - Name: CORALOGIX_PRIVATE_KEY
+              ValueFrom: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${CoralogixKeyParameter}'
+          HealthCheck:
+            Command: ['CMD-SHELL', 'wget -qO- http://localhost:13133/ || exit 1']
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 30
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !ImportValue
+                Fn::Sub: '${ProjectName}-log-group'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: otel-collector
+
+  CollectorService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: otel-collector
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref CollectorTaskDef
+      # DAEMON = exactly one copy on every instance in the cluster, forever.
+      SchedulingStrategy: DAEMON
+      LaunchType: EC2
+
+  # ===========================================================================
+  #  TASK DEFINITION 2 - stand-in for RDS
+  # ===========================================================================
+  #  CUSTOMER: DELETE this task definition and this service. Point PG_DSN /
+  #  PG_URL at your real RDS endpoint instead. The auto-instrumented `db.*`
+  #  spans look identical either way - this only exists so the POC costs
+  #  nothing extra.
+  PostgresTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-postgres'
+      NetworkMode: host
+      RequiresCompatibilities: [EC2]
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: '${ProjectName}-exec-role'
+      ContainerDefinitions:
+        - Name: postgres
+          Image: public.ecr.aws/docker/library/postgres:16-alpine
+          Essential: true
+          MemoryReservation: 200
+          Environment:
+            - Name: POSTGRES_USER
+              Value: hub
+            - Name: POSTGRES_PASSWORD
+              Value: hubdemo        # demo-only, never reachable off-host
+            - Name: POSTGRES_DB
+              Value: hub
+            - Name: PGDATA
+              Value: /tmp/pgdata    # ephemeral on purpose - it is a demo
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !ImportValue
+                Fn::Sub: '${ProjectName}-log-group'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: postgres
+
+  PostgresService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: postgres
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref PostgresTaskDef
+      DesiredCount: 1
+      LaunchType: EC2
+
+  # ===========================================================================
+  #  TASK DEFINITION 3 - edge-dotnet   (ALB + API Gateway / F5)
+  # ===========================================================================
+  EdgeDotnetTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-edge-dotnet'
+      NetworkMode: host
+      RequiresCompatibilities: [EC2]
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: '${ProjectName}-exec-role'
+      TaskRoleArn: !ImportValue
+        Fn::Sub: '${ProjectName}-task-role'
+      ContainerDefinitions:
+        - Name: edge-dotnet
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}/edge-dotnet:${ImageTag}'
+          Essential: true
+          MemoryReservation: 300
+          Environment:
+            # ---- THE ONLY OPENTELEMETRY CONFIGURATION THAT EXISTS ----------
+            - Name: OTEL_SERVICE_NAME              # -> Coralogix subsystem
+              Value: edge-dotnet
+            - Name: OTEL_RESOURCE_ATTRIBUTES       # service.namespace -> Coralogix application
+              Value: service.namespace=moh-hub-poc,deployment.environment=poc
+            - Name: OTEL_EXPORTER_OTLP_ENDPOINT    # the DAEMON collector, same host
+              Value: http://localhost:4318
+            - Name: OTEL_EXPORTER_OTLP_PROTOCOL
+              Value: http/protobuf
+            - Name: OTEL_TRACES_EXPORTER
+              Value: otlp
+            - Name: OTEL_METRICS_EXPORTER
+              Value: otlp
+            - Name: OTEL_LOGS_EXPORTER
+              Value: otlp
+            - Name: OTEL_TRACES_SAMPLER            # 100% - NO SAMPLING
+              Value: always_on
+            - Name: OTEL_PROPAGATORS
+              Value: tracecontext,baggage
+            # ---- application config ---------------------------------------
+            # CUSTOMER: in your infra this is your internal API GW / Lambda URL.
+            - Name: HUB_ROUTER_URL
+              Value: http://localhost:8081
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !ImportValue
+                Fn::Sub: '${ProjectName}-log-group'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: edge-dotnet
+
+  EdgeDotnetService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: edge-dotnet
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref EdgeDotnetTaskDef
+      DesiredCount: 1
+      LaunchType: EC2
+
+  # ===========================================================================
+  #  TASK DEFINITION 4 - hub-python   (BLUE routing Lambda)
+  # ===========================================================================
+  HubPythonTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-hub-python'
+      NetworkMode: host
+      RequiresCompatibilities: [EC2]
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: '${ProjectName}-exec-role'
+      TaskRoleArn: !ImportValue
+        Fn::Sub: '${ProjectName}-task-role'
+      ContainerDefinitions:
+        - Name: hub-python
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}/hub-python:${ImageTag}'
+          Essential: true
+          MemoryReservation: 220
+          Environment:
+            - Name: OTEL_SERVICE_NAME
+              Value: hub-python
+            - Name: OTEL_RESOURCE_ATTRIBUTES
+              Value: service.namespace=moh-hub-poc,deployment.environment=poc
+            - Name: OTEL_EXPORTER_OTLP_ENDPOINT
+              Value: http://localhost:4318
+            - Name: OTEL_EXPORTER_OTLP_PROTOCOL
+              Value: http/protobuf
+            - Name: OTEL_TRACES_EXPORTER
+              Value: otlp
+            - Name: OTEL_METRICS_EXPORTER
+              Value: otlp
+            - Name: OTEL_LOGS_EXPORTER
+              Value: otlp
+            - Name: OTEL_TRACES_SAMPLER
+              Value: always_on
+            - Name: OTEL_PROPAGATORS
+              Value: tracecontext,baggage
+            # Python-specific: stamp trace_id/span_id onto every stdlib log
+            # record and ship the records over OTLP.
+            - Name: OTEL_PYTHON_LOG_CORRELATION
+              Value: 'true'
+            - Name: OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED
+              Value: 'true'
+            # ---- application config ---------------------------------------
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: BLUE_QUEUE_URL
+              Value: !ImportValue
+                Fn::Sub: '${ProjectName}-blue-queue-url'
+            # CUSTOMER: replace with your RDS DSN.
+            - Name: PG_DSN
+              Value: postgresql://hub:hubdemo@localhost:5432/hub
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !ImportValue
+                Fn::Sub: '${ProjectName}-log-group'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: hub-python
+
+  HubPythonService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: hub-python
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref HubPythonTaskDef
+      DesiredCount: 1
+      LaunchType: EC2
+
+  # ===========================================================================
+  #  TASK DEFINITION 5 - worker-node   (the SQS Lambdas)
+  # ===========================================================================
+  WorkerNodeTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-worker-node'
+      NetworkMode: host
+      RequiresCompatibilities: [EC2]
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: '${ProjectName}-exec-role'
+      TaskRoleArn: !ImportValue
+        Fn::Sub: '${ProjectName}-task-role'
+      ContainerDefinitions:
+        - Name: worker-node
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}/worker-node:${ImageTag}'
+          Essential: true
+          MemoryReservation: 220
+          Environment:
+            - Name: OTEL_SERVICE_NAME
+              Value: worker-node
+            - Name: OTEL_RESOURCE_ATTRIBUTES
+              Value: service.namespace=moh-hub-poc,deployment.environment=poc
+            - Name: OTEL_EXPORTER_OTLP_ENDPOINT
+              Value: http://localhost:4318
+            - Name: OTEL_EXPORTER_OTLP_PROTOCOL
+              Value: http/protobuf
+            - Name: OTEL_TRACES_EXPORTER
+              Value: otlp
+            - Name: OTEL_METRICS_EXPORTER
+              Value: otlp
+            - Name: OTEL_LOGS_EXPORTER
+              Value: otlp
+            - Name: OTEL_TRACES_SAMPLER
+              Value: always_on
+            - Name: OTEL_PROPAGATORS
+              Value: tracecontext,baggage
+            # ---- application config ---------------------------------------
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: BLUE_QUEUE_URL
+              Value: !ImportValue
+                Fn::Sub: '${ProjectName}-blue-queue-url'
+            - Name: GREEN_QUEUE_URL
+              Value: !ImportValue
+                Fn::Sub: '${ProjectName}-green-queue-url'
+            - Name: PG_URL
+              Value: postgresql://hub:hubdemo@localhost:5432/hub
+            # CUSTOMER: in your infra this is your F5 API Gateway URL.
+            - Name: F5_CALLBACK_URL
+              Value: http://localhost:8080/f5/clinic-callback
+            - Name: PORT
+              Value: '8082'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !ImportValue
+                Fn::Sub: '${ProjectName}-log-group'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: worker-node
+
+  WorkerNodeService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: worker-node
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref WorkerNodeTaskDef
+      DesiredCount: 1
+      LaunchType: EC2
+
+  # ===========================================================================
+  #  TASK DEFINITION 6 - loadgen   (always-on demo traffic)
+  # ===========================================================================
+  #  CUSTOMER: DELETE this. Your real clinics are the traffic.
+  #  Deliberately NOT instrumented, so the root span of every trace is your own
+  #  edge service - exactly like production.
+  LoadgenTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-loadgen'
+      NetworkMode: host
+      RequiresCompatibilities: [EC2]
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: '${ProjectName}-exec-role'
+      ContainerDefinitions:
+        - Name: loadgen
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}/loadgen:${ImageTag}'
+          Essential: true
+          MemoryReservation: 32
+          Environment:
+            - Name: EDGE_URL
+              Value: http://localhost:8080
+            - Name: GREEN_TRIGGER_URL
+              Value: http://localhost:8082
+            # ~6 BLUE transactions/minute. Enough for continuous APM data,
+            # small enough to stay cheap.
+            - Name: INTERVAL
+              Value: '10'
+            - Name: GREEN_EVERY
+              Value: '3'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !ImportValue
+                Fn::Sub: '${ProjectName}-log-group'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: loadgen
+
+  LoadgenService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: loadgen
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref LoadgenTaskDef
+      DesiredCount: 1
+      LaunchType: EC2
+
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+  Note:
+    Value: >
+      Give it ~3 minutes, then query Coralogix:
+      cx spans "filter $l.applicationName == 'moh-hub-poc'" --start now-15m

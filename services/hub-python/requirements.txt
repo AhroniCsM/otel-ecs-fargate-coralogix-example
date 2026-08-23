@@ -1,0 +1,17 @@
+# --- application deps (what your Lambda/service would normally need) --------
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+boto3==1.35.90
+psycopg2-binary==2.9.10
+
+# --- OpenTelemetry AUTO instrumentation ------------------------------------
+# `opentelemetry-distro` gives you the `opentelemetry-instrument` launcher.
+# The three instrumentation packages below are the ones this service needs.
+# In a real project run `opentelemetry-bootstrap -a install` and it will pick
+# the right ones by inspecting your installed libraries.
+opentelemetry-distro==0.50b0
+opentelemetry-exporter-otlp==1.29.0
+opentelemetry-instrumentation-fastapi==0.50b0
+opentelemetry-instrumentation-botocore==0.50b0
+opentelemetry-instrumentation-psycopg2==0.50b0
+opentelemetry-instrumentation-logging==0.50b0

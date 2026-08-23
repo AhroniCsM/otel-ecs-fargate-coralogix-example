@@ -1,0 +1,160 @@
+# =============================================================================
+#  Coralogix OpenTelemetry Collector (CDOT) — ECS/EC2 daemon agent
+# =============================================================================
+#  Runs as an ECS DAEMON service in networkMode=host, so every application task
+#  on the same EC2 instance can reach it at http://localhost:4318.
+#
+#  This file is the ONLY place where telemetry is shaped. Note especially the
+#  `transform/hub_message_id` processor: it lifts the Ministry of Health
+#  business GUID onto the span as a first-class attribute WITHOUT any of the
+#  applications writing a single line of OpenTelemetry code.
+# =============================================================================
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Protects the collector on a small instance. Tune limit_mib to ~75% of the
+  # container's memory reservation.
+  memory_limiter:
+    check_interval: 2s
+    limit_mib: 300
+    spike_limit_mib: 80
+
+  # Adds cloud.*, aws.ecs.*, host.* resource attributes so you can slice APM by
+  # cluster / task / instance in Coralogix.
+  resourcedetection/ecs:
+    detectors: [env, ecs, ec2]
+    timeout: 5s
+    override: false
+
+  # ===========================================================================
+  #  THE CORRELATION PROCESSOR  —  read this one carefully
+  # ===========================================================================
+  #  The BLUE flow and the GREEN flow are asynchronous, so they legitimately get
+  #  DIFFERENT trace IDs. The Ministry of Health joins them on the business GUID
+  #  (`hub_message_id` / `message_id`) from the JSON contract.
+  #
+  #  The applications simply carry that GUID in the request URL (query string).
+  #  Every OpenTelemetry auto-instrumentation records the URL on its HTTP spans
+  #  for free. So here — in infrastructure config, not application code — we
+  #  parse the GUID out of the URL and promote it to `hub.message_id`.
+  #
+  #  Result in Coralogix: one search on `hub.message_id` returns the spans of
+  #  BOTH traces, and from there you open each trace in full.
+  #
+  #  We try several attribute names because different language SDKs are on
+  #  different HTTP semantic-convention versions.
+  # ===========================================================================
+  transform/hub_message_id:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          # (a) stable semconv, client spans:  url.full
+          - 'set(cache["a"], ExtractPatterns(attributes["url.full"], "hub_message_id=(?P<id>[0-9a-fA-F-]{36})")) where attributes["url.full"] != nil'
+          - 'set(attributes["hub.message_id"], cache["a"]["id"]) where cache["a"] != nil'
+          # (b) stable semconv, server spans:  url.query
+          - 'set(cache["b"], ExtractPatterns(attributes["url.query"], "hub_message_id=(?P<id>[0-9a-fA-F-]{36})")) where attributes["hub.message_id"] == nil and attributes["url.query"] != nil'
+          - 'set(attributes["hub.message_id"], cache["b"]["id"]) where attributes["hub.message_id"] == nil and cache["b"] != nil'
+          # (c) legacy semconv, client spans:  http.url
+          - 'set(cache["c"], ExtractPatterns(attributes["http.url"], "hub_message_id=(?P<id>[0-9a-fA-F-]{36})")) where attributes["hub.message_id"] == nil and attributes["http.url"] != nil'
+          - 'set(attributes["hub.message_id"], cache["c"]["id"]) where attributes["hub.message_id"] == nil and cache["c"] != nil'
+          # (d) legacy semconv, server spans:  http.target
+          - 'set(cache["d"], ExtractPatterns(attributes["http.target"], "hub_message_id=(?P<id>[0-9a-fA-F-]{36})")) where attributes["hub.message_id"] == nil and attributes["http.target"] != nil'
+          - 'set(attributes["hub.message_id"], cache["d"]["id"]) where attributes["hub.message_id"] == nil and cache["d"] != nil'
+          # Tag which of the two MoH flows the span belongs to, for easy filtering.
+          - 'set(attributes["moh.flow"], "green") where IsMatch(attributes["hub.message_id"], ".") and (IsMatch(name, "(?i)clinic-callback") or IsMatch(name, "(?i)tamar") or IsMatch(name, "(?i)green"))'
+          - 'set(attributes["moh.flow"], "blue") where attributes["moh.flow"] == nil and IsMatch(attributes["hub.message_id"], ".")'
+
+    # Same idea for LOGS. Auto-instrumentation already attached trace_id/span_id
+    # to every log record, so once `hub.message_id` is here too you can go
+    # GUID -> log -> trace with one click.
+    #
+    # Two shapes to handle:
+    #  * Python/Node render the GUID into the message text, so we parse the body.
+    #  * .NET ILogger keeps the message TEMPLATE in the body and puts the
+    #    structured parameters in attributes, so we read the attribute directly.
+    log_statements:
+      - context: log
+        statements:
+          # .NET structured-logging parameter, e.g.
+          #   log.LogInformation("... hub_message_id={hub_message_id}", id)
+          - 'set(attributes["hub.message_id"], attributes["hub_message_id"]) where attributes["hub_message_id"] != nil'
+          # Python / Node rendered text
+          - 'set(cache["a"], ExtractPatterns(body, "hub_message_id=(?P<id>[0-9a-fA-F-]{36})")) where attributes["hub.message_id"] == nil and body != nil'
+          - 'set(attributes["hub.message_id"], cache["a"]["id"]) where attributes["hub.message_id"] == nil and cache["a"] != nil'
+
+  batch:
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+    timeout: 5s
+
+exporters:
+  # -------------------------------------------------------------------------
+  # CUSTOMER: this is the whole Coralogix integration.
+  #   CORALOGIX_DOMAIN      e.g. eu2.coralogix.com / us2.coralogix.com
+  #   CORALOGIX_PRIVATE_KEY a "Send-Your-Data" API key
+  # Both are injected by the ECS task definition from SSM Parameter Store.
+  # -------------------------------------------------------------------------
+  coralogix:
+    domain: "${env:CORALOGIX_DOMAIN}"
+    private_key: "${env:CORALOGIX_PRIVATE_KEY}"
+    # Fallbacks, used only when the attributes below are absent.
+    application_name: "moh-hub-poc"
+    subsystem_name: "unknown"
+    # Derive Coralogix application/subsystem from OTel resource attributes.
+    application_name_attributes:
+      - "service.namespace"
+    subsystem_name_attributes:
+      - "service.name"
+    timeout: 30s
+    sending_queue:
+      enabled: true
+      queue_size: 1000
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+
+  # Uncomment while troubleshooting to print spans to the container log.
+  # debug:
+  #   verbosity: detailed
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  # NOTE: no tail_sampling / probabilistic_sampler anywhere in this file.
+  # 100% of spans are forwarded to Coralogix, as required for the POC.
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection/ecs, transform/hub_message_id, batch]
+      exporters: [coralogix]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection/ecs, batch]
+      exporters: [coralogix]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection/ecs, transform/hub_message_id, batch]
+      exporters: [coralogix]
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      level: basic
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888

@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>edge</AssemblyName>
+    <RootNamespace>edge</RootNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <!-- ==========================================================================
+       NOTICE: there is NO OpenTelemetry NuGet package referenced here.
+       Tracing is added at RUNTIME by the OpenTelemetry .NET *automatic*
+       instrumentation agent (see Dockerfile). Your application code and your
+       .csproj stay completely untouched.
+       ========================================================================== -->
+</Project>
