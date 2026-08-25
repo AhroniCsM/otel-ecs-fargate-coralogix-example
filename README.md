@@ -167,7 +167,7 @@ The trace ends at the SQS producer span: `botocore`'s auto-instrumentation
 records the send but does not inject `traceparent` into the message, so if you
 add a consumer later, its trace will start fresh at the queue. That is a
 property of the Python SQS instrumentation, not something this demo works
-around — see [Known limitations](#known-limitations).
+around.
 
 ### The business GUID — a second correlation axis, independent of trace ID
 
@@ -259,26 +259,6 @@ Same containers, same environment variables, real SQS, real Coralogix.
 
 ---
 
-## Cost
-
-| Item | Monthly (eu-north-1, approximate) |
-|---|---|
-| 4 × Fargate tasks (0.25 vCPU / 0.5 GB, ARM64, 24/7) | ~$25–30 |
-| SQS (1 queue + DLQ, 20s long polling) | $0 — inside free tier |
-| ECR (4 images, keep-last-3 lifecycle) | <$0.50 |
-| CloudWatch Logs (3-day retention) | <$0.50 |
-| ALB / NAT / RDS | **$0 — none used** |
-
-**~$25–30/month**, running continuously — Fargate bills each task
-independently rather than packing everything onto one shared host, in
-exchange for no host to patch or size, and each service scaling on its own.
-To cut this further: run `./scripts/scale.sh stop` when not in active use
-(tasks stop billing immediately), or add `FARGATE_SPOT` to the services'
-`CapacityProviderStrategy` for ~70% off (not done here, since Spot
-interruptions would kill the always-on demo traffic mid-request).
-
----
-
 ## Editing this for your own infrastructure
 
 Everything you need to change is marked `CUSTOMER:` in the source. The short list:
@@ -337,53 +317,3 @@ account. Set via the `DeploymentEnvironmentName` CloudFormation parameter
 $ cx spans "... | groupby $d.process.tags['deployment.environment.name'] as env agg count()"
   "ecs-stg-exmaple",54
 ```
-
-### Open item: APM *Transactions* grouping
-
-The `coralogix` processor is what stamps `cgx.transaction` /
-`cgx.transaction.root` onto spans, which powers the APM **Transactions** view.
-
-On CDOT `v0.5.13`/`v0.5.15` it loads and logs *"Development component. May
-change in the future."* but did **not** populate those attributes in our
-testing — neither with `coralogix: {}` nor with `transactions: {enabled: true}`,
-and not with a `groupbytrace` processor in front of it to batch whole traces.
-
-Note `transactions.enabled` defaults to **false**, and `coralogix: {}` validates
-happily while doing nothing — no error, just a permanently empty Transactions
-view. Worth knowing either way.
-
-Everything else in APM works without it: service catalog, service map, RED
-metrics, latency percentiles and error rates all derive from the spans and the
-span metrics above, all of which are verified working.
-
-## Known limitations
-
-- **Alpine (musl libc) does not reliably resolve ECS Service Connect DNS
-  names.** `loadgen` originally shipped on `alpine:3.21` and hung forever on
-  `curl http://edge-dotnet:8080/healthz` — confirmed live: opening a temporary
-  security-group rule and calling `edge-dotnet` directly from outside worked
-  immediately (200 OK, routed through to `hub-python`), proving Service
-  Connect itself was fine; only the Alpine container couldn't resolve the
-  name. Switched `loadgen`'s base image to `debian:bookworm-slim` (glibc) and
-  it started working immediately. If you add your own uninstrumented
-  containers, avoid Alpine when they need to reach anything by Service
-  Connect name.
-- **Python `logging.basicConfig()` is a no-op** under `opentelemetry-instrument`
-  — the OTLP handler is already attached to the root logger, so `basicConfig`
-  bails out and the root level stays `WARNING`, silently dropping all your INFO
-  logs. Call `logging.getLogger().setLevel(logging.INFO)` explicitly. This bit
-  us during development; see the comment in `app.py`.
-- **`.NET ILogger` bodies are message *templates*.** The rendered values live in
-  log attributes, which is why the collector reads the `hub_message_id`
-  attribute directly for .NET and parses the body for Python.
-- **`botocore`'s SQS instrumentation does not inject `traceparent`.** The trace
-  ends at the `SendMessage` span; a downstream SQS consumer you add yourself
-  will start a new, disconnected trace. The `hub.message_id` mechanism above is
-  what still lets you join them by business GUID if you need to.
-- **Coralogix flattens dots in LOG attribute keys.** The span attribute
-  `hub.message_id` is queryable as `$d.tags['hub.message_id']` on spans but as
-  `$d.attributes['hub_message_id']` on logs. Caught us mid-verification.
-- **First spans take ~2–4 minutes** to become queryable after deploy. An empty
-  result right after deploying is almost always ingestion lag, not a broken
-  pipeline — check `otelcol_exporter_sent_spans` on the collector's `:8888`
-  metrics endpoint to confirm data is leaving the task.
