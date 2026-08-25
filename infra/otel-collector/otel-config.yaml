@@ -27,8 +27,9 @@ processors:
     spike_limit_mib: 90
 
   # Adds cloud.*, aws.ecs.* resource attributes so you can slice APM by
-  # cluster / task in Coralogix. No `ec2` detector: on Fargate there is no EC2
-  # host to introspect.
+  # cluster / task in Coralogix. Deliberately omits the `ec2` detector (an
+  # available detector in this OTel component we don't use, since Fargate
+  # tasks have no EC2 host to introspect).
   resourcedetection/ecs:
     detectors: [env, ecs]
     timeout: 5s
@@ -161,7 +162,7 @@ connectors:
   spanmetrics:
     histogram:
       explicit:
-        # Coralogix's recommended default buckets for ECS/EC2.
+        # Coralogix's recommended default buckets for ECS.
         buckets: [1ms, 4ms, 10ms, 20ms, 50ms, 100ms, 200ms, 500ms, 1s, 2s, 5s]
     # CUSTOMER: BE CAREFUL HERE. Every dimension multiplies the number of time
     # series. These are all low-cardinality and safe.

@@ -115,10 +115,10 @@ reaches Coralogix.**
 
 ### The collector — [`infra/otel-collector/otel-config.yaml`](infra/otel-collector/otel-config.yaml)
 
-Runs as a normal ECS Fargate **REPLICA** service (there is no DAEMON scheduling
-strategy on Fargate — no EC2 hosts to run one-per), published via **ECS
-Service Connect** as `otel-collector` so every application task can reach it
-at `http://otel-collector:4318` regardless of which ENI it actually landed on.
+Runs as a normal ECS Fargate **REPLICA** service (Fargate has no DAEMON
+scheduling strategy), published via **ECS Service Connect** as
+`otel-collector` so every application task can reach it at
+`http://otel-collector:4318` regardless of which ENI it actually landed on.
 
 ```yaml
 exporters:
@@ -254,15 +254,13 @@ Same containers, same environment variables, real SQS, real Coralogix.
 | CloudWatch Logs (3-day retention) | <$0.50 |
 | ALB / NAT / RDS | **$0 — none used** |
 
-**~$25–30/month**, running continuously. That is *more* than the old
-single-EC2-instance layout (~$15/month for one shared `t4g.small`), because
-Fargate bills each task independently instead of packing everything onto one
-box — the trade is no host to patch or size, and each service scales on its
-own. To cut this further: run `./scripts/scale.sh stop` when not in active use
-(tasks stop billing immediately, no instance to terminate), or add
-`FARGATE_SPOT` to the services' `CapacityProviderStrategy` for ~70% off
-(not done here, since Spot interruptions would kill the always-on demo
-traffic mid-request).
+**~$25–30/month**, running continuously — Fargate bills each task
+independently rather than packing everything onto one shared host, in
+exchange for no host to patch or size, and each service scaling on its own.
+To cut this further: run `./scripts/scale.sh stop` when not in active use
+(tasks stop billing immediately), or add `FARGATE_SPOT` to the services'
+`CapacityProviderStrategy` for ~70% off (not done here, since Spot
+interruptions would kill the always-on demo traffic mid-request).
 
 ---
 
@@ -342,21 +340,6 @@ view. Worth knowing either way.
 Everything else in APM works without it: service catalog, service map, RED
 metrics, latency percentiles and error rates all derive from the spans and the
 span metrics above, all of which are verified working.
-
-## Why Fargate instead of EC2 (what changed)
-
-This repo used to run everything on a single EC2 instance with
-`networkMode: host`, which meant every service reached every other one at
-`localhost` — and came with two ECS gotchas that ate real debugging time:
-a rolling deployment that hangs forever binding an already-used port, and
-`AvailabilityZoneRebalancing` needing to be force-disabled. Moving to Fargate
-with `networkMode: awsvpc` removes both problems structurally: every task gets
-its own ENI, so there is never a port collision, and ECS's normal rolling
-deployment (start-new-before-stopping-old) just works. The cost of that
-simplicity is that services now need a real discovery mechanism instead of
-`localhost` — solved here with **ECS Service Connect**, which is also why the
-old hand-rolled `LaunchTemplate` + `AutoScalingGroup` pair is gone: Fargate
-tasks don't run on instances you manage.
 
 ## Known limitations
 

@@ -97,8 +97,8 @@ Resources:
   # ===========================================================================
   #  TASK DEFINITION 1 - the Coralogix collector (normal REPLICA service)
   # ===========================================================================
-  #  Fargate has no DAEMON scheduling strategy (no EC2 hosts to run one-per).
-  #  Instead this runs as a single REPLICA service, published via ECS Service
+  #  Fargate has no DAEMON scheduling strategy, so this runs as a single
+  #  REPLICA service instead, published via ECS Service
   #  Connect as "otel-collector" so every application task can reach it at
   #  http://otel-collector:4318 regardless of which ENI it's actually on.
   CollectorTaskDef:

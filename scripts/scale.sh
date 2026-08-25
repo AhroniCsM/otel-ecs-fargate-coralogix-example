@@ -6,9 +6,9 @@
 #    ./scripts/scale.sh start    -> tasks back, traffic resumes in ~1 min
 #    ./scripts/scale.sh status
 #
-#  On Fargate there is no EC2 instance to terminate - "stop" just scales every
-#  service's desired count to 0, which stops billing for that service's tasks
-#  immediately. What is left behind costs approximately nothing: SQS queues,
+#  "stop" just scales every service's desired count to 0, which stops
+#  billing for that service's tasks immediately. What is left behind
+#  costs approximately nothing: SQS queues,
 #  ECR images with a keep-last-3 lifecycle, IAM roles, and a 3-day CloudWatch
 #  log group.
 # =============================================================================
