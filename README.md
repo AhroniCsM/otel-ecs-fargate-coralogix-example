@@ -1,9 +1,24 @@
 # OpenTelemetry auto-instrumentation on ECS Fargate → Coralogix
 
-A minimal, always-on reference implementation of the **Ministry of Health HUB**
-`BLUE` flow, instrumented with **OpenTelemetry automatic instrumentation
-only** — there is not one manual span, tracer or `opentelemetry` import in
-any application file.
+## What this guide teaches you
+
+How to get **OpenTelemetry automatic instrumentation** — zero application
+code, zero manual spans — working for **.NET 8** and **Python 3.12** services
+running on **AWS ECS Fargate**, shipping traces, metrics and logs to
+Coralogix with full APM. Everything you need is here: the exact Dockerfile
+changes for each language ([`services/edge-dotnet/Dockerfile`](services/edge-dotnet/Dockerfile),
+[`services/hub-python/Dockerfile`](services/hub-python/Dockerfile)), the
+environment variables that wire it up, the ECS Fargate task/service definitions
+(`awsvpc` networking, ECS Service Connect for service discovery, the
+collector as its own Fargate service), and a working, deployable example you
+can run end to end and adapt to your own services.
+
+The example below (a "Ministry of Health HUB" scenario, two services passing
+a request through to SQS) is just the vehicle for demonstrating the pattern —
+swap it for your own services once you see how the instrumentation and the
+Fargate wiring fit together. It is instrumented with **OpenTelemetry
+automatic instrumentation only** — there is not one manual span, tracer or
+`opentelemetry` import in any application file.
 
 It answers one question in particular:
 
