@@ -4,7 +4,7 @@ set -euo pipefail
 REGION="${AWS_REGION:-eu-north-1}"
 PROJECT="${PROJECT_NAME:-moh-hub-otel}"
 
-echo "==> deleting compute stack (EC2 instance, ECS services)"
+echo "==> deleting compute stack (ECS Fargate services)"
 aws cloudformation delete-stack --region "$REGION" --stack-name "${PROJECT}-ecs"
 aws cloudformation wait stack-delete-complete --region "$REGION" --stack-name "${PROJECT}-ecs"
 

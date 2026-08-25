@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   MoH HUB OTel POC - stack 1/2 (foundation).
-  SQS queues for the BLUE/GREEN flows + DLQ, ECR repositories, ECS IAM roles,
+  SQS queue for the BLUE flow + DLQ, ECR repositories, ECS IAM roles,
   and the CloudWatch log group. Everything here is free or well inside free tier.
 
 Parameters:
@@ -13,9 +13,9 @@ Parameters:
 Resources:
 
   # ===========================================================================
-  #  SQS - the async boundary between the BLUE and the GREEN flow
+  #  SQS - the async terminus of the BLUE flow
   # ===========================================================================
-  # CUSTOMER: these are Standard queues (cheapest, simplest). Your production
+  # CUSTOMER: this is a Standard queue (cheapest, simplest). Your production
   # HUB uses FIFO. OpenTelemetry context propagation works identically on FIFO -
   # the W3C `traceparent` travels in a MessageAttribute either way. To switch,
   # add FifoQueue: true + a .fifo name suffix and pass MessageGroupId on send.
@@ -30,17 +30,6 @@ Resources:
     Properties:
       QueueName: !Sub '${ProjectName}-blue'
       # 20s long polling on the consumer keeps us far inside the SQS free tier.
-      ReceiveMessageWaitTimeSeconds: 20
-      VisibilityTimeout: 60
-      MessageRetentionPeriod: 3600
-      RedrivePolicy:
-        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
-        maxReceiveCount: 3
-
-  GreenQueue:
-    Type: AWS::SQS::Queue
-    Properties:
-      QueueName: !Sub '${ProjectName}-green'
       ReceiveMessageWaitTimeSeconds: 20
       VisibilityTimeout: 60
       MessageRetentionPeriod: 3600
@@ -63,14 +52,6 @@ Resources:
     Type: AWS::ECR::Repository
     Properties:
       RepositoryName: !Sub '${ProjectName}/hub-python'
-      EmptyOnDelete: true
-      LifecyclePolicy:
-        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"keep last 3","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":3},"action":{"type":"expire"}}]}'
-
-  EcrWorkerNode:
-    Type: AWS::ECR::Repository
-    Properties:
-      RepositoryName: !Sub '${ProjectName}/worker-node'
       EmptyOnDelete: true
       LifecyclePolicy:
         LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"keep last 3","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":3},"action":{"type":"expire"}}]}'
@@ -129,7 +110,7 @@ Resources:
                 Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/*'
 
   # (2) TASK role - used by the application code inside the containers.
-  #     Least privilege: only the two queues, nothing else.
+  #     Least privilege: only the queue, nothing else.
   TaskRole:
     Type: AWS::IAM::Role
     Properties:
@@ -154,37 +135,11 @@ Resources:
                   - sqs:GetQueueUrl
                 Resource:
                   - !GetAtt BlueQueue.Arn
-                  - !GetAtt GreenQueue.Arn
-
-  # (3) EC2 instance role - lets the ECS agent on the instance join the cluster.
-  InstanceRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub '${ProjectName}-instance'
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal: { Service: ec2.amazonaws.com }
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
-        # Lets you SSM into the box for debugging - no SSH key, no port 22.
-        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
-
-  InstanceProfile:
-    Type: AWS::IAM::InstanceProfile
-    Properties:
-      InstanceProfileName: !Sub '${ProjectName}-instance'
-      Roles: [!Ref InstanceRole]
 
 Outputs:
   BlueQueueUrl:
     Value: !Ref BlueQueue
     Export: { Name: !Sub '${ProjectName}-blue-queue-url' }
-  GreenQueueUrl:
-    Value: !Ref GreenQueue
-    Export: { Name: !Sub '${ProjectName}-green-queue-url' }
   EcrRegistry:
     Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com'
   ExecutionRoleArn:
@@ -193,9 +148,6 @@ Outputs:
   TaskRoleArn:
     Value: !GetAtt TaskRole.Arn
     Export: { Name: !Sub '${ProjectName}-task-role' }
-  InstanceProfileArn:
-    Value: !GetAtt InstanceProfile.Arn
-    Export: { Name: !Sub '${ProjectName}-instance-profile' }
   LogGroupName:
     Value: !Ref LogGroup
     Export: { Name: !Sub '${ProjectName}-log-group' }

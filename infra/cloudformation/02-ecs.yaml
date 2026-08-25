@@ -1,9 +1,9 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   MoH HUB OTel POC - stack 2/2 (compute).
-  One ECS-on-EC2 cluster, a single t4g.small instance, and six services: the
-  Coralogix collector (DAEMON), a stand-in RDS, the three auto-instrumented
-  applications, and the always-on traffic generator.
+  One ECS Fargate cluster and three services - the Coralogix collector,
+  the two auto-instrumented applications (edge-dotnet, hub-python), and the
+  always-on traffic generator - wired together with ECS Service Connect.
 
 Parameters:
   ProjectName:
@@ -16,21 +16,9 @@ Parameters:
 
   SubnetId:
     Type: AWS::EC2::Subnet::Id
-    Description: A PUBLIC subnet in that VPC (needs egress to ECR / SQS / Coralogix).
-
-  # CUSTOMER: t4g.small = 2 vCPU / 2 GiB on Graviton - the cheapest instance that
-  # comfortably runs all six containers (~USD 12/month in eu-north-1).
-  # For x86 images use t3.small AND change EcsAmiId below to the x86 SSM path.
-  InstanceType:
-    Type: String
-    Default: t4g.small
-
-  EcsAmiId:
-    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
-    Default: /aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id
     Description: >
-      ECS-optimized AMI. arm64 path shown. For x86 use
-      /aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id
+      A PUBLIC subnet in that VPC. Fargate tasks get AssignPublicIp=ENABLED so
+      they can reach ECR / SQS / Coralogix without a NAT gateway.
 
   ImageTag:
     Type: String
@@ -58,6 +46,18 @@ Parameters:
 
 Resources:
 
+  # ===========================================================================
+  #  Service discovery - backs ECS Service Connect
+  # ===========================================================================
+  #  Every task talks to every other task by service name (e.g.
+  #  http://otel-collector:4318, http://hub-python:8081) instead of localhost,
+  #  because on Fargate (networkMode=awsvpc) each task gets its own ENI/IP.
+  Namespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: !Sub '${ProjectName}.local'
+      Vpc: !Ref VpcId
+
   Cluster:
     Type: AWS::ECS::Cluster
     Properties:
@@ -66,79 +66,52 @@ Resources:
         # Disabled = no extra CloudWatch charges. All telemetry goes to Coralogix.
         - Name: containerInsights
           Value: disabled
+      ServiceConnectDefaults:
+        Namespace: !GetAtt Namespace.Arn
 
   # ===========================================================================
   #  Networking
   # ===========================================================================
-  # NOTE: there are NO inbound rules at all. Every task uses networkMode=host,
-  # so all service-to-service traffic is localhost and never leaves the box.
-  # Nothing needs to be reachable from outside. Use SSM Session Manager (already
-  # allowed by the instance role) if you need a shell - no SSH key, no port 22.
-  InstanceSecurityGroup:
+  #  All tasks share one security group and are reachable from each other on
+  #  any port (self-referencing ingress) - service-to-service traffic now runs
+  #  over each task's own ENI instead of localhost. Use SSM Session Manager /
+  #  `aws ecs execute-command` if you need a shell - no SSH key, no port 22.
+  TaskSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: !Sub '${ProjectName} ECS instance - egress only'
+      GroupDescription: !Sub '${ProjectName} Fargate tasks'
       VpcId: !Ref VpcId
       SecurityGroupEgress:
         - IpProtocol: -1
           CidrIp: 0.0.0.0/0
-          Description: ECR, SQS, SSM and Coralogix ingress
+          Description: ECR, SQS, SSM and Coralogix egress
 
-  LaunchTemplate:
-    Type: AWS::EC2::LaunchTemplate
+  TaskSecurityGroupSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
     Properties:
-      LaunchTemplateName: !Sub '${ProjectName}-lt'
-      LaunchTemplateData:
-        ImageId: !Ref EcsAmiId
-        InstanceType: !Ref InstanceType
-        IamInstanceProfile:
-          Arn: !ImportValue
-            Fn::Sub: '${ProjectName}-instance-profile'
-        SecurityGroupIds: [!Ref InstanceSecurityGroup]
-        MetadataOptions:
-          HttpTokens: required          # IMDSv2 only
-        BlockDeviceMappings:
-          - DeviceName: /dev/xvda
-            Ebs:
-              VolumeSize: 30
-              VolumeType: gp3
-              DeleteOnTermination: true
-              Encrypted: true
-        # This one line is all it takes to join the ECS cluster.
-        UserData:
-          Fn::Base64: !Sub |
-            #!/bin/bash
-            echo "ECS_CLUSTER=${ProjectName}" >> /etc/ecs/ecs.config
-            echo "ECS_ENABLE_CONTAINER_METADATA=true" >> /etc/ecs/ecs.config
-
-  AutoScalingGroup:
-    Type: AWS::AutoScaling::AutoScalingGroup
-    Properties:
-      AutoScalingGroupName: !Sub '${ProjectName}-asg'
-      MinSize: '1'
-      MaxSize: '1'
-      DesiredCapacity: '1'
-      VPCZoneIdentifier: [!Ref SubnetId]
-      LaunchTemplate:
-        LaunchTemplateId: !Ref LaunchTemplate
-        Version: !GetAtt LaunchTemplate.LatestVersionNumber
-      Tags:
-        - Key: Name
-          Value: !Sub '${ProjectName}-ecs'
-          PropagateAtLaunch: true
+      GroupId: !Ref TaskSecurityGroup
+      SourceSecurityGroupId: !Ref TaskSecurityGroup
+      IpProtocol: -1
+      Description: Allow tasks in this security group to reach each other
 
   # ===========================================================================
-  #  TASK DEFINITION 1 - the Coralogix collector (runs as a DAEMON)
+  #  TASK DEFINITION 1 - the Coralogix collector (normal REPLICA service)
   # ===========================================================================
-  #  networkMode: host means every application container reaches it at
-  #  http://localhost:4318 - no service discovery, no sidecars, one collector
-  #  per EC2 instance. This is the pattern in the Coralogix ECS-EC2 docs.
+  #  Fargate has no DAEMON scheduling strategy (no EC2 hosts to run one-per).
+  #  Instead this runs as a single REPLICA service, published via ECS Service
+  #  Connect as "otel-collector" so every application task can reach it at
+  #  http://otel-collector:4318 regardless of which ENI it's actually on.
   CollectorTaskDef:
     Type: AWS::ECS::TaskDefinition
     Properties:
       Family: !Sub '${ProjectName}-otel-collector'
-      NetworkMode: host
-      RequiresCompatibilities: [EC2]
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: '256'
+      Memory: '512'
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
       ExecutionRoleArn: !ImportValue
         Fn::Sub: '${ProjectName}-exec-role'
       ContainerDefinitions:
@@ -147,7 +120,14 @@ Resources:
           Essential: true
           # 448 MiB: the spanmetrics connector holds an in-memory aggregation of
           # every service/operation/dimension combination until it flushes.
-          MemoryReservation: 448
+          Memory: 448
+          PortMappings:
+            - ContainerPort: 4317
+              Name: otel-grpc
+              AppProtocol: grpc
+            - ContainerPort: 4318
+              Name: otel-http
+              AppProtocol: http
           Environment:
             - Name: CORALOGIX_DOMAIN
               Value: !Ref CoralogixDomain
@@ -176,79 +156,37 @@ Resources:
       ServiceName: otel-collector
       Cluster: !Ref Cluster
       TaskDefinition: !Ref CollectorTaskDef
-      # DAEMON = exactly one copy on every instance in the cluster, forever.
-      SchedulingStrategy: DAEMON
-      LaunchType: EC2
-
-  # ===========================================================================
-  #  TASK DEFINITION 2 - stand-in for RDS
-  # ===========================================================================
-  #  CUSTOMER: DELETE this task definition and this service. Point PG_DSN /
-  #  PG_URL at your real RDS endpoint instead. The auto-instrumented `db.*`
-  #  spans look identical either way - this only exists so the POC costs
-  #  nothing extra.
-  PostgresTaskDef:
-    Type: AWS::ECS::TaskDefinition
-    Properties:
-      Family: !Sub '${ProjectName}-postgres'
-      NetworkMode: host
-      RequiresCompatibilities: [EC2]
-      ExecutionRoleArn: !ImportValue
-        Fn::Sub: '${ProjectName}-exec-role'
-      ContainerDefinitions:
-        - Name: postgres
-          Image: public.ecr.aws/docker/library/postgres:16-alpine
-          Essential: true
-          MemoryReservation: 200
-          Environment:
-            - Name: POSTGRES_USER
-              Value: hub
-            - Name: POSTGRES_PASSWORD
-              Value: hubdemo        # demo-only, never reachable off-host
-            - Name: POSTGRES_DB
-              Value: hub
-            - Name: PGDATA
-              Value: /tmp/pgdata    # ephemeral on purpose - it is a demo
-          LogConfiguration:
-            LogDriver: awslogs
-            Options:
-              awslogs-group: !ImportValue
-                Fn::Sub: '${ProjectName}-log-group'
-              awslogs-region: !Ref AWS::Region
-              awslogs-stream-prefix: postgres
-
-  PostgresService:
-    Type: AWS::ECS::Service
-    Properties:
-      ServiceName: postgres
-      Cluster: !Ref Cluster
-      TaskDefinition: !Ref PostgresTaskDef
       DesiredCount: 1
-      # Must be DISABLED whenever MaximumPercent <= 100 (ECS rejects the
-      # combination). We only run one instance in one AZ, so rebalancing has
-      # nothing to do anyway.
-      AvailabilityZoneRebalancing: DISABLED
-      DeploymentConfiguration:
-        # CRITICAL FOR networkMode: host.
-        # ECS defaults to MinimumHealthyPercent=100 / MaximumPercent=200, i.e.
-        # start the new task BEFORE stopping the old one. With host networking
-        # the new task then fails with "address already in use" and the
-        # deployment hangs forever. 0/100 = stop the old task first.
-        # (Fine for a POC. If you need zero-downtime rollouts, move the
-        # applications to awsvpc or bridge networking with dynamic host ports.)
-        MinimumHealthyPercent: 0
-        MaximumPercent: 100
-      LaunchType: EC2
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref SubnetId]
+          SecurityGroups: [!Ref TaskSecurityGroup]
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: !GetAtt Namespace.Arn
+        Services:
+          - PortName: otel-http
+            DiscoveryName: otel-collector
+            ClientAliases:
+              - Port: 4318
+                DnsName: otel-collector
 
   # ===========================================================================
-  #  TASK DEFINITION 3 - edge-dotnet   (ALB + API Gateway / F5)
+  #  TASK DEFINITION 2 - edge-dotnet   (ALB + API Gateway / F5)
   # ===========================================================================
   EdgeDotnetTaskDef:
     Type: AWS::ECS::TaskDefinition
     Properties:
       Family: !Sub '${ProjectName}-edge-dotnet'
-      NetworkMode: host
-      RequiresCompatibilities: [EC2]
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: '256'
+      Memory: '512'
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
       ExecutionRoleArn: !ImportValue
         Fn::Sub: '${ProjectName}-exec-role'
       TaskRoleArn: !ImportValue
@@ -257,7 +195,11 @@ Resources:
         - Name: edge-dotnet
           Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}/edge-dotnet:${ImageTag}'
           Essential: true
-          MemoryReservation: 300
+          Memory: 512
+          PortMappings:
+            - ContainerPort: 8080
+              Name: edge-dotnet
+              AppProtocol: http
           Environment:
             # ---- THE ONLY OPENTELEMETRY CONFIGURATION THAT EXISTS ----------
             - Name: OTEL_SERVICE_NAME              # -> Coralogix subsystem
@@ -268,8 +210,8 @@ Resources:
               #   (`deployment.environment` is the deprecated spelling; we set
               #    both so older SDKs and tooling still pick it up)
               Value: !Sub 'service.namespace=moh-hub-poc,deployment.environment.name=${DeploymentEnvironmentName},deployment.environment=${DeploymentEnvironmentName}'
-            - Name: OTEL_EXPORTER_OTLP_ENDPOINT    # the DAEMON collector, same host
-              Value: http://localhost:4318
+            - Name: OTEL_EXPORTER_OTLP_ENDPOINT    # the collector, via Service Connect
+              Value: http://otel-collector:4318
             - Name: OTEL_EXPORTER_OTLP_PROTOCOL
               Value: http/protobuf
             - Name: OTEL_TRACES_EXPORTER
@@ -285,7 +227,7 @@ Resources:
             # ---- application config ---------------------------------------
             # CUSTOMER: in your infra this is your internal API GW / Lambda URL.
             - Name: HUB_ROUTER_URL
-              Value: http://localhost:8081
+              Value: http://hub-python:8081
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -301,31 +243,36 @@ Resources:
       Cluster: !Ref Cluster
       TaskDefinition: !Ref EdgeDotnetTaskDef
       DesiredCount: 1
-      # Must be DISABLED whenever MaximumPercent <= 100 (ECS rejects the
-      # combination). We only run one instance in one AZ, so rebalancing has
-      # nothing to do anyway.
-      AvailabilityZoneRebalancing: DISABLED
-      DeploymentConfiguration:
-        # CRITICAL FOR networkMode: host.
-        # ECS defaults to MinimumHealthyPercent=100 / MaximumPercent=200, i.e.
-        # start the new task BEFORE stopping the old one. With host networking
-        # the new task then fails with "address already in use" and the
-        # deployment hangs forever. 0/100 = stop the old task first.
-        # (Fine for a POC. If you need zero-downtime rollouts, move the
-        # applications to awsvpc or bridge networking with dynamic host ports.)
-        MinimumHealthyPercent: 0
-        MaximumPercent: 100
-      LaunchType: EC2
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref SubnetId]
+          SecurityGroups: [!Ref TaskSecurityGroup]
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: !GetAtt Namespace.Arn
+        Services:
+          - PortName: edge-dotnet
+            DiscoveryName: edge-dotnet
+            ClientAliases:
+              - Port: 8080
+                DnsName: edge-dotnet
 
   # ===========================================================================
-  #  TASK DEFINITION 4 - hub-python   (BLUE routing Lambda)
+  #  TASK DEFINITION 3 - hub-python   (BLUE routing Lambda)
   # ===========================================================================
   HubPythonTaskDef:
     Type: AWS::ECS::TaskDefinition
     Properties:
       Family: !Sub '${ProjectName}-hub-python'
-      NetworkMode: host
-      RequiresCompatibilities: [EC2]
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: '256'
+      Memory: '512'
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
       ExecutionRoleArn: !ImportValue
         Fn::Sub: '${ProjectName}-exec-role'
       TaskRoleArn: !ImportValue
@@ -334,7 +281,11 @@ Resources:
         - Name: hub-python
           Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}/hub-python:${ImageTag}'
           Essential: true
-          MemoryReservation: 220
+          Memory: 512
+          PortMappings:
+            - ContainerPort: 8081
+              Name: hub-python
+              AppProtocol: http
           Environment:
             - Name: OTEL_SERVICE_NAME
               Value: hub-python
@@ -345,7 +296,7 @@ Resources:
               #    both so older SDKs and tooling still pick it up)
               Value: !Sub 'service.namespace=moh-hub-poc,deployment.environment.name=${DeploymentEnvironmentName},deployment.environment=${DeploymentEnvironmentName}'
             - Name: OTEL_EXPORTER_OTLP_ENDPOINT
-              Value: http://localhost:4318
+              Value: http://otel-collector:4318
             - Name: OTEL_EXPORTER_OTLP_PROTOCOL
               Value: http/protobuf
             - Name: OTEL_TRACES_EXPORTER
@@ -370,9 +321,6 @@ Resources:
             - Name: BLUE_QUEUE_URL
               Value: !ImportValue
                 Fn::Sub: '${ProjectName}-blue-queue-url'
-            # CUSTOMER: replace with your RDS DSN.
-            - Name: PG_DSN
-              Value: postgresql://hub:hubdemo@localhost:5432/hub
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -388,112 +336,24 @@ Resources:
       Cluster: !Ref Cluster
       TaskDefinition: !Ref HubPythonTaskDef
       DesiredCount: 1
-      # Must be DISABLED whenever MaximumPercent <= 100 (ECS rejects the
-      # combination). We only run one instance in one AZ, so rebalancing has
-      # nothing to do anyway.
-      AvailabilityZoneRebalancing: DISABLED
-      DeploymentConfiguration:
-        # CRITICAL FOR networkMode: host.
-        # ECS defaults to MinimumHealthyPercent=100 / MaximumPercent=200, i.e.
-        # start the new task BEFORE stopping the old one. With host networking
-        # the new task then fails with "address already in use" and the
-        # deployment hangs forever. 0/100 = stop the old task first.
-        # (Fine for a POC. If you need zero-downtime rollouts, move the
-        # applications to awsvpc or bridge networking with dynamic host ports.)
-        MinimumHealthyPercent: 0
-        MaximumPercent: 100
-      LaunchType: EC2
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref SubnetId]
+          SecurityGroups: [!Ref TaskSecurityGroup]
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: !GetAtt Namespace.Arn
+        Services:
+          - PortName: hub-python
+            DiscoveryName: hub-python
+            ClientAliases:
+              - Port: 8081
+                DnsName: hub-python
 
   # ===========================================================================
-  #  TASK DEFINITION 5 - worker-node   (the SQS Lambdas)
-  # ===========================================================================
-  WorkerNodeTaskDef:
-    Type: AWS::ECS::TaskDefinition
-    Properties:
-      Family: !Sub '${ProjectName}-worker-node'
-      NetworkMode: host
-      RequiresCompatibilities: [EC2]
-      ExecutionRoleArn: !ImportValue
-        Fn::Sub: '${ProjectName}-exec-role'
-      TaskRoleArn: !ImportValue
-        Fn::Sub: '${ProjectName}-task-role'
-      ContainerDefinitions:
-        - Name: worker-node
-          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}/worker-node:${ImageTag}'
-          Essential: true
-          MemoryReservation: 220
-          Environment:
-            - Name: OTEL_SERVICE_NAME
-              Value: worker-node
-            - Name: OTEL_RESOURCE_ATTRIBUTES
-              # service.namespace       -> Coralogix APPLICATION
-              # deployment.environment.name -> Coralogix ENVIRONMENT
-              #   (`deployment.environment` is the deprecated spelling; we set
-              #    both so older SDKs and tooling still pick it up)
-              Value: !Sub 'service.namespace=moh-hub-poc,deployment.environment.name=${DeploymentEnvironmentName},deployment.environment=${DeploymentEnvironmentName}'
-            - Name: OTEL_EXPORTER_OTLP_ENDPOINT
-              Value: http://localhost:4318
-            - Name: OTEL_EXPORTER_OTLP_PROTOCOL
-              Value: http/protobuf
-            - Name: OTEL_TRACES_EXPORTER
-              Value: otlp
-            - Name: OTEL_METRICS_EXPORTER
-              Value: otlp
-            - Name: OTEL_LOGS_EXPORTER
-              Value: otlp
-            - Name: OTEL_TRACES_SAMPLER
-              Value: always_on
-            - Name: OTEL_PROPAGATORS
-              Value: tracecontext,baggage
-            # ---- application config ---------------------------------------
-            - Name: AWS_REGION
-              Value: !Ref AWS::Region
-            - Name: BLUE_QUEUE_URL
-              Value: !ImportValue
-                Fn::Sub: '${ProjectName}-blue-queue-url'
-            - Name: GREEN_QUEUE_URL
-              Value: !ImportValue
-                Fn::Sub: '${ProjectName}-green-queue-url'
-            - Name: PG_URL
-              Value: postgresql://hub:hubdemo@localhost:5432/hub
-            # CUSTOMER: in your infra this is your F5 API Gateway URL.
-            - Name: F5_CALLBACK_URL
-              Value: http://localhost:8080/f5/clinic-callback
-            - Name: PORT
-              Value: '8082'
-          LogConfiguration:
-            LogDriver: awslogs
-            Options:
-              awslogs-group: !ImportValue
-                Fn::Sub: '${ProjectName}-log-group'
-              awslogs-region: !Ref AWS::Region
-              awslogs-stream-prefix: worker-node
-
-  WorkerNodeService:
-    Type: AWS::ECS::Service
-    Properties:
-      ServiceName: worker-node
-      Cluster: !Ref Cluster
-      TaskDefinition: !Ref WorkerNodeTaskDef
-      DesiredCount: 1
-      # Must be DISABLED whenever MaximumPercent <= 100 (ECS rejects the
-      # combination). We only run one instance in one AZ, so rebalancing has
-      # nothing to do anyway.
-      AvailabilityZoneRebalancing: DISABLED
-      DeploymentConfiguration:
-        # CRITICAL FOR networkMode: host.
-        # ECS defaults to MinimumHealthyPercent=100 / MaximumPercent=200, i.e.
-        # start the new task BEFORE stopping the old one. With host networking
-        # the new task then fails with "address already in use" and the
-        # deployment hangs forever. 0/100 = stop the old task first.
-        # (Fine for a POC. If you need zero-downtime rollouts, move the
-        # applications to awsvpc or bridge networking with dynamic host ports.)
-        MinimumHealthyPercent: 0
-        MaximumPercent: 100
-      LaunchType: EC2
-
-  # ===========================================================================
-  #  TASK DEFINITION 6 - loadgen   (always-on demo traffic)
+  #  TASK DEFINITION 4 - loadgen   (always-on demo traffic)
   # ===========================================================================
   #  CUSTOMER: DELETE this. Your real clinics are the traffic.
   #  Deliberately NOT instrumented, so the root span of every trace is your own
@@ -502,26 +362,27 @@ Resources:
     Type: AWS::ECS::TaskDefinition
     Properties:
       Family: !Sub '${ProjectName}-loadgen'
-      NetworkMode: host
-      RequiresCompatibilities: [EC2]
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: '256'
+      Memory: '512'
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
       ExecutionRoleArn: !ImportValue
         Fn::Sub: '${ProjectName}-exec-role'
       ContainerDefinitions:
         - Name: loadgen
           Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}/loadgen:${ImageTag}'
           Essential: true
-          MemoryReservation: 32
+          Memory: 128
           Environment:
             - Name: EDGE_URL
-              Value: http://localhost:8080
-            - Name: GREEN_TRIGGER_URL
-              Value: http://localhost:8082
+              Value: http://edge-dotnet:8080
             # ~6 BLUE transactions/minute. Enough for continuous APM data,
             # small enough to stay cheap.
             - Name: INTERVAL
               Value: '10'
-            - Name: GREEN_EVERY
-              Value: '3'
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -537,21 +398,17 @@ Resources:
       Cluster: !Ref Cluster
       TaskDefinition: !Ref LoadgenTaskDef
       DesiredCount: 1
-      # Must be DISABLED whenever MaximumPercent <= 100 (ECS rejects the
-      # combination). We only run one instance in one AZ, so rebalancing has
-      # nothing to do anyway.
-      AvailabilityZoneRebalancing: DISABLED
-      DeploymentConfiguration:
-        # CRITICAL FOR networkMode: host.
-        # ECS defaults to MinimumHealthyPercent=100 / MaximumPercent=200, i.e.
-        # start the new task BEFORE stopping the old one. With host networking
-        # the new task then fails with "address already in use" and the
-        # deployment hangs forever. 0/100 = stop the old task first.
-        # (Fine for a POC. If you need zero-downtime rollouts, move the
-        # applications to awsvpc or bridge networking with dynamic host ports.)
-        MinimumHealthyPercent: 0
-        MaximumPercent: 100
-      LaunchType: EC2
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref SubnetId]
+          SecurityGroups: [!Ref TaskSecurityGroup]
+      # Client-only: loadgen calls edge-dotnet by Service Connect name but
+      # publishes nothing of its own, so there is no `Services` list.
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: !GetAtt Namespace.Arn
 
 Outputs:
   ClusterName:

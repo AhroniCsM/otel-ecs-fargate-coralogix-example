@@ -1,65 +1,59 @@
-# OpenTelemetry auto-instrumentation on ECS/EC2 → Coralogix
+# OpenTelemetry auto-instrumentation on ECS Fargate → Coralogix
 
 A minimal, always-on reference implementation of the **Ministry of Health HUB**
-flows (`BLUE` and `GREEN`), instrumented with **OpenTelemetry automatic
-instrumentation only** — there is not one manual span, tracer or
-`opentelemetry` import in any application file.
+`BLUE` flow, instrumented with **OpenTelemetry automatic instrumentation
+only** — there is not one manual span, tracer or `opentelemetry` import in
+any application file.
 
 It answers one question in particular:
 
-> The BLUE and GREEN flows are asynchronous, so each one gets its own Trace ID.
-> How do we tie a clinic's request to the answer that comes back to it?
+> Two different language runtimes (.NET and Python), two hops of HTTP, one SQS
+> hand-off at the end. How much of that shows up in Coralogix if you write
+> **zero** OpenTelemetry code?
 
-**Answer, verified end to end:** you get three independent correlation
-mechanisms, and you need all three. See [Correlating the two flows](#correlating-the-two-flows).
+**Answer, verified end to end:** all of it — one continuous trace across both
+services, full APM (service map, RED metrics, latency), and a business GUID
+promoted onto every span and log line so you can search by transaction
+instead of by trace ID. See [Correlating request and logs](#correlating-request-and-logs).
 
 ---
 
 ## What runs
 
-Everything sits on **one `t4g.small` EC2 instance** in **one ECS cluster**, six
-ECS services, `networkMode: host` throughout (so every hop is `localhost` —
-no ALB, no NAT gateway, no service discovery, no Cloud Map).
+One ECS **Fargate** cluster, four services, wired together with **ECS Service
+Connect** (each task gets its own ENI; service-to-service calls resolve by
+name — `http://hub-python:8081`, `http://otel-collector:4318` — instead of
+`localhost`).
 
 | Your architecture | This repo | Language |
 |---|---|---|
 | AWS ALB + API Gateway (F5) | `edge-dotnet` :8080 | **.NET 8** |
 | BLUE routing Lambda | `hub-python` :8081 | **Python 3.12** |
 | SQS (blue) | `moh-hub-otel-blue` | real SQS |
-| BLUE Lambda → RDS | `worker-node` | **Node.js 22** |
-| RDS | `postgres` :5432 container | *stand-in, see below* |
-| RDS change → SQS (green) | `worker-node` :8082 | **Node.js 22** |
-| SQS (green) | `moh-hub-otel-green` | real SQS |
-| GREEN Lambda → F5 API GW | `worker-node` | **Node.js 22** |
 | Outpatient clinic (מרפאת חוץ) | `loadgen` | *uninstrumented on purpose* |
-| — | `otel-collector` (ECS **DAEMON**) | Coralogix CDOT |
+| — | `otel-collector` (ECS **Fargate service**) | Coralogix CDOT |
 
-### The two flows
+### The flow
 
 ```
 BLUE  (clinic → MoH)
-  loadgen ──HTTP──▶ edge-dotnet ──HTTP──▶ hub-python ──▶ SQS(blue) ──▶ worker-node ──▶ RDS
-          (clinic)   ALB + API GW          routing λ                    DB-writer λ
-
-GREEN (MoH → clinic)
-  loadgen ──HTTP──▶ worker-node ──▶ SQS(green) ──▶ worker-node ──HTTP──▶ edge-dotnet
-          (trigger)  RDS→SQS λ                     dispatch λ            F5 API GW → clinic
+  loadgen ──HTTP──▶ edge-dotnet ──HTTP──▶ hub-python ──▶ SQS(blue)
+          (clinic)   ALB + API GW          routing λ      (terminus of the demo)
 ```
 
-`loadgen` runs forever (one BLUE transaction every 10s, a GREEN trigger every
-30s), so there is always live APM data. It is deliberately **not**
-instrumented: a real clinic is a third party outside your account, so the root
-span of every trace should be *your* edge service — which is exactly what you get.
+`loadgen` runs forever (one BLUE transaction every 10s), so there is always
+live APM data. It is deliberately **not** instrumented: a real clinic is a
+third party outside your account, so the root span of every trace should be
+*your* edge service — which is exactly what you get.
 
 ---
 
 ## How the auto-instrumentation is wired (the part you care about)
 
 Each service has **zero** OpenTelemetry code. Look at
-[`services/edge-dotnet/Program.cs`](services/edge-dotnet/Program.cs),
-[`services/hub-python/app.py`](services/hub-python/app.py) and
-[`services/worker-node/index.js`](services/worker-node/index.js) — no imports,
-no spans. All of it is Dockerfile + environment variables.
+[`services/edge-dotnet/Program.cs`](services/edge-dotnet/Program.cs) and
+[`services/hub-python/app.py`](services/hub-python/app.py) — no imports, no
+spans. All of it is Dockerfile + environment variables.
 
 ### .NET 8 — [`services/edge-dotnet/Dockerfile`](services/edge-dotnet/Dockerfile)
 
@@ -89,49 +83,30 @@ One pip package, one command prefix.
 
 ```dockerfile
 RUN pip install opentelemetry-distro opentelemetry-exporter-otlp \
-                opentelemetry-instrumentation-{fastapi,botocore,psycopg2,logging}
+                opentelemetry-instrumentation-{fastapi,botocore,logging}
 ENTRYPOINT ["opentelemetry-instrument", "uvicorn", "app:app", ...]
 ```
 
-Gives you: FastAPI server spans, botocore/SQS spans, psycopg2 `db.*` spans,
-and `trace_id` on every stdlib log record.
+Gives you: FastAPI server spans, botocore/SQS spans, and `trace_id` on every
+stdlib log record.
 
 > **On Lambda instead of ECS:** attach the ADOT Lambda layer and set
 > `AWS_LAMBDA_EXEC_WRAPPER=/opt/otel-instrument`. Same auto-instrumentation.
 
-### Node.js 22 — [`services/worker-node/Dockerfile`](services/worker-node/Dockerfile)
-
-One npm package, one environment variable.
-
-```dockerfile
-ENV NODE_OPTIONS="--require @opentelemetry/auto-instrumentations-node/register"
-```
-
-Gives you: `http`/`undici` spans, **real SQS messaging spans**, `pg` spans.
-
-> ⚠️ **Version pinning is not optional here.**
-> `@opentelemetry/instrumentation-aws-sdk` patches the AWS SDK's internal
-> `@smithy/*` packages. We originally pinned `auto-instrumentations-node@0.55`
-> against `@aws-sdk/client-sqs@3.1116`; the instrumentation hooks
-> `@smithy/smithy-client`, which newer SDKs no longer ship, so it **silently
-> failed to patch** — we lost every SQS span and all SQS trace propagation, with
-> no error anywhere. After any upgrade, confirm you still see
-> `<queue-name> send` / `<queue-name> receive` spans.
-
-### The environment variables that matter (identical in all three services)
+### The environment variables that matter (identical in both services)
 
 Set in [`infra/cloudformation/02-ecs.yaml`](infra/cloudformation/02-ecs.yaml):
 
 ```bash
-OTEL_SERVICE_NAME=edge-dotnet                     # → Coralogix SUBSYSTEM
+OTEL_SERVICE_NAME=edge-dotnet                            # → Coralogix SUBSYSTEM
 OTEL_RESOURCE_ATTRIBUTES=service.namespace=moh-hub-poc,deployment.environment.name=ecs-stg-exmaple,deployment.environment=ecs-stg-exmaple
-                                                  # service.namespace → Coralogix APPLICATION
-OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 # the DAEMON collector on the same host
+                                                          # service.namespace → Coralogix APPLICATION
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318   # the collector, via ECS Service Connect
 OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 OTEL_TRACES_EXPORTER=otlp
 OTEL_METRICS_EXPORTER=otlp
 OTEL_LOGS_EXPORTER=otlp
-OTEL_TRACES_SAMPLER=always_on                     # 100% — NO SAMPLING
+OTEL_TRACES_SAMPLER=always_on                            # 100% — NO SAMPLING
 OTEL_PROPAGATORS=tracecontext,baggage
 ```
 
@@ -140,9 +115,10 @@ reaches Coralogix.**
 
 ### The collector — [`infra/otel-collector/otel-config.yaml`](infra/otel-collector/otel-config.yaml)
 
-Runs as an ECS **DAEMON** service in host network mode: one collector per EC2
-instance, reachable at `localhost:4318`. This is the pattern from the
-[Coralogix ECS-EC2 docs](https://coralogix.com/docs/opentelemetry/configuration-options/aws-ecs-ec2-using-opentelemetry/).
+Runs as a normal ECS Fargate **REPLICA** service (there is no DAEMON scheduling
+strategy on Fargate — no EC2 hosts to run one-per), published via **ECS
+Service Connect** as `otel-collector` so every application task can reach it
+at `http://otel-collector:4318` regardless of which ENI it actually landed on.
 
 ```yaml
 exporters:
@@ -158,62 +134,33 @@ ECS agent at container start. It is never in git, never in a task definition.
 
 ---
 
-## Correlating the two flows
+## Correlating request and logs
 
-### 1. Same Trace ID — every synchronous HTTP hop
+### Same Trace ID — every synchronous HTTP hop
 
-W3C `traceparent` is injected and extracted automatically. Verified:
+W3C `traceparent` is injected and extracted automatically across both HTTP
+hops. Verified:
 
 ```
 ROOT edge-dotnet   POST /api/v1/hub/messages
        edge-dotnet   POST                        (HttpClient)
          hub-python    POST /process             ← same trace, different service
-           hub-python    pg.query:SELECT
            hub-python    SQS.SendMessage
 ```
 
-### 2. Span links (`FOLLOWS_FROM`) — across SQS, where the SDK supports it
+The trace ends at the SQS producer span: `botocore`'s auto-instrumentation
+records the send but does not inject `traceparent` into the message, so if you
+add a consumer later, its trace will start fresh at the queue. That is a
+property of the Python SQS instrumentation, not something this demo works
+around — see [Known limitations](#known-limitations).
 
-Node's auto-instrumentation injects `traceparent` into the SQS
-`MessageAttributes` on send. Confirmed by reading a live message off the queue:
+### The business GUID — a second correlation axis, independent of trace ID
 
-```json
-"MessageAttributes": {
-  "hub_message_id": {...}, "message_id": {...},
-  "traceparent": { "StringValue": "00-8c34f7255d2ddb45d39b1605cc12de85-9216930c49a593dd-01" }
-}
-```
-
-On receive, the current instrumentation adds a **span link** (not a parent), so
-Coralogix shows:
-
-```
-flattenedLinks: traceId-c7d2ddbb3e6087c9c7cdde7cd463a65b:spanId-3af13994859df1ee:linkType-FOLLOWS_FROM
-```
-
-> Requires `MessageAttributeNames: ['All']` on `ReceiveMessage`. Without it the
-> attributes are not returned and the consumer starts a disconnected trace.
-
-### 3. The business GUID — works across **every** boundary
-
-**This is the mechanism you must build on**, because mechanism 2 is not
-universally available:
-
-| Producer SDK | Injects `traceparent` into SQS? | Consumer SDK | Extracts it? |
-|---|---|---|---|
-| **Node** `@opentelemetry/instrumentation-aws-sdk` | ✅ yes | **Node** | ✅ yes, as a span **link** |
-| **Python** `opentelemetry-instrumentation-botocore` | ❌ **no** | **Python** | ❌ no |
-| **.NET** `OpenTelemetry.Instrumentation.AWS` | ✅ yes | **.NET** | opt-in |
-
-We read the Python SQS extension's source to confirm: it only sets attributes
-(`messaging.system`, `aws.queue_url`, `messaging.message_id`) and never touches
-propagation. **A Python producer therefore always breaks the trace at the
-queue.** That is precisely the situation you described, and no amount of
-configuration fixes it.
-
-So the applications carry `hub_message_id` in the request URL and an
-`x-hub-message-id` header, and the **collector** — not the application — lifts
-it onto the span:
+Even with everything on one trace, you often want to search by a **business**
+identifier instead of a trace ID — "show me every span and log line for
+transaction X", from a support ticket or a customer email. So the applications
+carry `hub_message_id` in the request URL and an `x-hub-message-id` header,
+and the **collector** — not the application — lifts it onto the span:
 
 ```yaml
 transform/hub_message_id:
@@ -230,16 +177,8 @@ its HTTP spans, in every language, with no configuration. Put the GUID where
 the instrumentation is already looking and you get it for free.
 
 The same processor also promotes it on **logs**, so `hub.message_id` +
-`trace_id` sit on every log record and you can go GUID → log → trace.
-
-**Result** — one GUID resolves to exactly the two traces of the transaction:
-
-```
-### one business GUID -> how many traces?
-  "d52399eb-d586-4980-8fde-7266efedf33c",  traces=2
-  "e3d6ddc7-f753-4413-9620-b49cc39d6be2",  traces=2
-  "cdacebab-2b02-44af-91ca-3826c78eb75e",  traces=2
-```
+`trace_id` sit on every log record and you can go GUID → log → trace, or
+trace → log, with one search.
 
 ### Which field? `Hub_Message_ID` or `Message_ID`?
 
@@ -265,7 +204,7 @@ export AWS_REGION=eu-north-1
 ```
 
 That stores the key in SSM, deploys both CloudFormation stacks, and builds and
-pushes all five images. Traffic starts immediately.
+pushes all four images. Traffic starts immediately.
 
 ### Verify from the terminal
 
@@ -285,17 +224,17 @@ Same containers, same environment variables, real SQS, real Coralogix.
 ### Stop / start without destroying
 
 ```bash
-./scripts/scale.sh stop      # EC2 instance terminated, cost ~= $0
-./scripts/scale.sh start     # back up, traffic resumes in ~2 minutes
+./scripts/scale.sh stop      # every task stopped, cost ~= $0
+./scripts/scale.sh start     # back up, traffic resumes in ~1 minute
 ./scripts/scale.sh status
 ```
 
 > **Heads-up if you run this in a Coralogix AWS account.** There is an
 > account-level automation (IAM principal `eks-ecs-auto-scaler`) that scales
 > **every ECS service in the account to `desiredCount: 0`** on a schedule — it
-> hit this lab at 01:00 local time, including the DAEMON collector and services
-> in unrelated clusters. If your demo is mysteriously dead in the morning, that
-> is why. Run `./scripts/scale.sh start` before showing anything to a customer.
+> hit this lab at 01:00 local time, including services in unrelated clusters.
+> If your demo is mysteriously dead in the morning, that is why. Run
+> `./scripts/scale.sh start` before showing anything to a customer.
 
 ### Tear down
 
@@ -307,17 +246,23 @@ Same containers, same environment variables, real SQS, real Coralogix.
 
 ## Cost
 
-| Item | Monthly (eu-north-1) |
+| Item | Monthly (eu-north-1, approximate) |
 |---|---|
-| 1 × `t4g.small` EC2 (Graviton) | ~$12 |
-| 30 GB gp3 EBS | ~$2.50 |
-| SQS (~2 queues, 20s long polling) | $0 — inside free tier |
-| ECR (5 images, keep-last-3 lifecycle) | <$0.50 |
+| 4 × Fargate tasks (0.25 vCPU / 0.5 GB, ARM64, 24/7) | ~$25–30 |
+| SQS (1 queue + DLQ, 20s long polling) | $0 — inside free tier |
+| ECR (4 images, keep-last-3 lifecycle) | <$0.50 |
 | CloudWatch Logs (3-day retention) | <$0.50 |
 | ALB / NAT / RDS | **$0 — none used** |
 
-**~$15/month.** Deliberate choices: `host` networking instead of an ALB, a
-Postgres container instead of RDS, Graviton instead of x86, and no NAT gateway.
+**~$25–30/month**, running continuously. That is *more* than the old
+single-EC2-instance layout (~$15/month for one shared `t4g.small`), because
+Fargate bills each task independently instead of packing everything onto one
+box — the trade is no host to patch or size, and each service scales on its
+own. To cut this further: run `./scripts/scale.sh stop` when not in active use
+(tasks stop billing immediately, no instance to terminate), or add
+`FARGATE_SPOT` to the services' `CapacityProviderStrategy` for ~70% off
+(not done here, since Spot interruptions would kill the always-on demo
+traffic mid-request).
 
 ---
 
@@ -325,21 +270,21 @@ Postgres container instead of RDS, Graviton instead of x86, and no NAT gateway.
 
 Everything you need to change is marked `CUSTOMER:` in the source. The short list:
 
-1. **`infra/cloudformation/02-ecs.yaml`** — delete the `Postgres*` and
-   `Loadgen*` task definitions and services. Point `PG_DSN` / `PG_URL` at your
-   real RDS endpoint and `F5_CALLBACK_URL` at your real F5 API Gateway.
+1. **`infra/cloudformation/02-ecs.yaml`** — delete the `Loadgen*` task
+   definition and service; your real clinics are the traffic.
 2. **`CoralogixDomain`** — your region's domain.
 3. **`HUB_ROUTER_URL`** — your internal API Gateway / Lambda URL instead of
-   `localhost:8081`.
-4. **SQS FIFO** — the queues here are Standard for simplicity. Propagation is
+   `http://hub-python:8081`.
+4. **SQS FIFO** — the queue here is Standard for simplicity. Propagation is
    identical on FIFO (the `traceparent` rides in a `MessageAttribute` either
    way); add `FifoQueue: true`, a `.fifo` name suffix, and a `MessageGroupId`.
-5. **Multiple EC2 instances** — nothing to change. The collector is a DAEMON, so
-   each new instance gets its own, and `localhost:4318` keeps working. But
-   `host` networking means one task per port per instance, so if you scale out
-   the applications, switch them to `awsvpc`/`bridge` and point
-   `OTEL_EXPORTER_OTLP_ENDPOINT` at the EC2 private IP
-   (`ECS_CONTAINER_METADATA` / `169.254.169.254`) instead of `localhost`.
+5. **Scaling out** — bump `DesiredCount` and/or add more subnets (one per AZ)
+   to `NetworkConfiguration.AwsvpcConfiguration.Subnets`. Nothing else changes:
+   every task already reaches the others by Service Connect name, not by IP,
+   so adding tasks or AZs is transparent to the application code.
+6. **A private VPC instead of a public subnet** — drop `AssignPublicIp` and
+   add a NAT gateway (or VPC endpoints for ECR/SQS/S3/CloudWatch Logs), since
+   Fargate tasks otherwise need a public IP to reach those services.
 
 ## Full APM, not just traces
 
@@ -354,7 +299,6 @@ and error-rate charts. Verified live:
 $ cx metrics query 'sum by (service_name) (increase(traces_span_metrics_calls_total[10m]))'
   "edge-dotnet","153"
   "hub-python","255"
-  "worker-node","949"
 ```
 
 The metric family Coralogix receives is:
@@ -367,10 +311,9 @@ The metric family Coralogix receives is:
 
 > **Cost warning, and it matters.** Every `dimensions:` entry multiplies the
 > time-series count. The dimensions here (`http.request.method`,
-> `http.response.status_code`, `messaging.system`, `db.system`) are all
-> low-cardinality. **Never add `hub.message_id`** — it is a GUID per
-> transaction, so it would create one time series per request. Keep the GUID on
-> spans, off metrics.
+> `http.response.status_code`, `messaging.system`) are all low-cardinality.
+> **Never add `hub.message_id`** — it is a GUID per transaction, so it would
+> create one time series per request. Keep the GUID on spans, off metrics.
 
 **2. Environment separation** — `deployment.environment.name` becomes the
 Environment facet in APM, which is how you keep stg and prod apart in one
@@ -400,34 +343,33 @@ Everything else in APM works without it: service catalog, service map, RED
 metrics, latency percentiles and error rates all derive from the spans and the
 span metrics above, all of which are verified working.
 
-## Two ECS gotchas this repo already solves for you
+## Why Fargate instead of EC2 (what changed)
 
-Both cost real debugging time, and neither produces a useful error message.
-
-**1. `networkMode: host` + the default deployment config = a deploy that hangs forever.**
-ECS defaults to `minimumHealthyPercent: 100` / `maximumPercent: 200`, i.e. start
-the new task *before* stopping the old one. With host networking the new task
-cannot bind the port and you get:
-
-```
-ERROR: [Errno 98] error while attempting to bind on address ('0.0.0.0', 8081): address already in use
-```
-
-...on repeat, with `rolloutState: IN_PROGRESS` stuck indefinitely. The services
-here set `0` / `100` so ECS stops the old task first.
-
-**2. `AvailabilityZoneRebalancing` must be `DISABLED` when `maximumPercent <= 100`.**
-ECS enables it by default on new services and then rejects the combination:
-
-> `Availability Zone Rebalancing does not support maximumPercent <= 100 % as deployment configuration`
-
-Set explicitly on every service in the template.
+This repo used to run everything on a single EC2 instance with
+`networkMode: host`, which meant every service reached every other one at
+`localhost` — and came with two ECS gotchas that ate real debugging time:
+a rolling deployment that hangs forever binding an already-used port, and
+`AvailabilityZoneRebalancing` needing to be force-disabled. Moving to Fargate
+with `networkMode: awsvpc` removes both problems structurally: every task gets
+its own ENI, so there is never a port collision, and ECS's normal rolling
+deployment (start-new-before-stopping-old) just works. The cost of that
+simplicity is that services now need a real discovery mechanism instead of
+`localhost` — solved here with **ECS Service Connect**, which is also why the
+old hand-rolled `LaunchTemplate` + `AutoScalingGroup` pair is gone: Fargate
+tasks don't run on instances you manage.
 
 ## Known limitations
 
-- **Node `console.log` is not shipped over OTLP.** OpenTelemetry Node only
-  auto-instruments `winston`/`bunyan`/`pino`. `worker-node`'s logs reach
-  CloudWatch but not Coralogix. Use a supported logger if you need them.
+- **Alpine (musl libc) does not reliably resolve ECS Service Connect DNS
+  names.** `loadgen` originally shipped on `alpine:3.21` and hung forever on
+  `curl http://edge-dotnet:8080/healthz` — confirmed live: opening a temporary
+  security-group rule and calling `edge-dotnet` directly from outside worked
+  immediately (200 OK, routed through to `hub-python`), proving Service
+  Connect itself was fine; only the Alpine container couldn't resolve the
+  name. Switched `loadgen`'s base image to `debian:bookworm-slim` (glibc) and
+  it started working immediately. If you add your own uninstrumented
+  containers, avoid Alpine when they need to reach anything by Service
+  Connect name.
 - **Python `logging.basicConfig()` is a no-op** under `opentelemetry-instrument`
   — the OTLP handler is already attached to the root logger, so `basicConfig`
   bails out and the root level stays `WARNING`, silently dropping all your INFO
@@ -436,12 +378,14 @@ Set explicitly on every service in the template.
 - **`.NET ILogger` bodies are message *templates*.** The rendered values live in
   log attributes, which is why the collector reads the `hub_message_id`
   attribute directly for .NET and parses the body for Python.
-- **The Postgres container is ephemeral** (`PGDATA=/tmp/pgdata`). Restarting the
-  task loses the data. That is intentional — it is a stand-in for RDS.
+- **`botocore`'s SQS instrumentation does not inject `traceparent`.** The trace
+  ends at the `SendMessage` span; a downstream SQS consumer you add yourself
+  will start a new, disconnected trace. The `hub.message_id` mechanism above is
+  what still lets you join them by business GUID if you need to.
 - **Coralogix flattens dots in LOG attribute keys.** The span attribute
   `hub.message_id` is queryable as `$d.tags['hub.message_id']` on spans but as
   `$d.attributes['hub_message_id']` on logs. Caught us mid-verification.
 - **First spans take ~2–4 minutes** to become queryable after deploy. An empty
   result right after deploying is almost always ingestion lag, not a broken
   pipeline — check `otelcol_exporter_sent_spans` on the collector's `:8888`
-  metrics endpoint to confirm data is leaving the host.
+  metrics endpoint to confirm data is leaving the task.

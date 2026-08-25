@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Build all five images for the ECS instance architecture and push to ECR.
+#  Build all four images for the ECS Fargate architecture and push to ECR.
 # =============================================================================
-#  CUSTOMER: ARCH must match the EC2 instance family in 02-ecs.yaml.
-#    t4g.*  (Graviton, cheapest) -> linux/arm64
-#    t3.*   (Intel)              -> linux/amd64
+#  CUSTOMER: ARCH must match RuntimePlatform.CpuArchitecture in 02-ecs.yaml.
+#    linux/arm64 (Graviton, cheapest) -> RuntimePlatform.CpuArchitecture: ARM64
+#    linux/amd64 (Intel)              -> RuntimePlatform.CpuArchitecture: X86_64
 # =============================================================================
 set -euo pipefail
 
@@ -32,7 +32,6 @@ build_push () {                      # $1 = image name, $2 = build context
 build_push otel-collector "$ROOT/infra/otel-collector"
 build_push edge-dotnet    "$ROOT/services/edge-dotnet"
 build_push hub-python     "$ROOT/services/hub-python"
-build_push worker-node    "$ROOT/services/worker-node"
 build_push loadgen        "$ROOT/loadgen"
 
 echo ">> done. all images pushed with tag '${TAG}'."

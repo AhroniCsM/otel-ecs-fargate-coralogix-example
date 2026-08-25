@@ -17,8 +17,8 @@ COPY app.py .
 EXPOSE 8081
 
 # THE ENTIRE INTEGRATION: prefix your normal start command with
-# `opentelemetry-instrument`. It monkey-patches FastAPI, botocore (SQS),
-# psycopg2 (RDS) and the stdlib logger at import time.
+# `opentelemetry-instrument`. It monkey-patches FastAPI, botocore (SQS)
+# and the stdlib logger at import time.
 #
 # CUSTOMER (AWS Lambda instead of ECS): use the ADOT Lambda layer and set
 #   AWS_LAMBDA_EXEC_WRAPPER=/opt/otel-instrument

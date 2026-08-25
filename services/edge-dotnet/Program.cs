@@ -6,9 +6,6 @@
 //   BLUE flow (clinic -> MoH):   AWS ALB  ->  API Gateway  ->  (routing Lambda)
 //       POST /api/v1/hub/messages     <-- the clinic calls this
 //
-//   GREEN flow (MoH -> clinic):  (green dispatch Lambda) -> F5 API GW -> clinic
-//       POST /f5/clinic-callback      <-- the green worker calls this
-//
 //  >>> CUSTOMER: THIS FILE CONTAINS ZERO OPENTELEMETRY CODE. <<<
 //  No `using OpenTelemetry`, no TracerProvider, no ActivitySource, no manual
 //  spans. Every span you will see in Coralogix is produced by the OpenTelemetry
@@ -18,7 +15,7 @@
 //  The ONLY thing this app does "on purpose" for observability is pass the
 //  business correlation GUID (hub_message_id) along as a query-string value and
 //  an HTTP header. That is a *business* requirement, not an OTel requirement --
-//  it is what lets you join the async BLUE trace to the async GREEN trace.
+//  it is what lets you join the request to its logs and downstream spans.
 // =============================================================================
 
 using System.Text;
@@ -37,10 +34,11 @@ var app = builder.Build();
 // -----------------------------------------------------------------------------
 // CUSTOMER: EDIT HERE.
 // In the real system this is the private DNS of your routing Lambda / internal
-// API Gateway. In this demo everything runs on one ECS-EC2 host with
-// networkMode=host, so services reach each other over localhost.
+// API Gateway. In this demo every service is its own ECS Fargate task
+// discovered by name via ECS Service Connect, so services reach each other by
+// service name instead of localhost.
 // -----------------------------------------------------------------------------
-var hubRouterUrl = Environment.GetEnvironmentVariable("HUB_ROUTER_URL") ?? "http://localhost:8081";
+var hubRouterUrl = Environment.GetEnvironmentVariable("HUB_ROUTER_URL") ?? "http://hub-python:8081";
 
 static string GetHubMessageId(HttpRequest req)
 {
@@ -52,7 +50,7 @@ static string GetHubMessageId(HttpRequest req)
 }
 
 // =============================================================================
-//  BLUE FLOW  —  step 1 of 5
+//  BLUE FLOW  —  step 1 of 2
 //  clinic  --HTTP-->  [ALB + API GW : this endpoint]  --HTTP-->  hub-python
 // =============================================================================
 app.MapPost("/api/v1/hub/messages", async (HttpRequest req, IHttpClientFactory factory,
@@ -65,7 +63,7 @@ app.MapPost("/api/v1/hub/messages", async (HttpRequest req, IHttpClientFactory f
 
     // Structured log: `hub_message_id` becomes a log ATTRIBUTE (not just text),
     // and the auto-instrumentation stamps trace_id/span_id onto this record.
-    log.LogInformation("BLUE 1/5 edge received clinic request hub_message_id={hub_message_id}",
+    log.LogInformation("BLUE 1/2 edge received clinic request hub_message_id={hub_message_id}",
                        hubMessageId);
 
     var client = factory.CreateClient();
@@ -88,26 +86,6 @@ app.MapPost("/api/v1/hub/messages", async (HttpRequest req, IHttpClientFactory f
         downstream_status = (int)resp.StatusCode,
         downstream = downstream
     });
-});
-
-// =============================================================================
-//  GREEN FLOW  —  step 5 of 5  (the async "answer" coming back to the clinic)
-//  worker-node  --HTTP-->  [F5 API GW : this endpoint]  -->  outpatient clinic
-// =============================================================================
-app.MapPost("/f5/clinic-callback", async (HttpRequest req, ILogger<Program> log) =>
-{
-    var hubMessageId = GetHubMessageId(req);
-    using var reader = new StreamReader(req.Body);
-    var body = await reader.ReadToEndAsync();
-
-    log.LogInformation("GREEN 5/5 F5 API GW delivered approval to clinic hub_message_id={hub_message_id}",
-                       hubMessageId);
-
-    // Pretend to hand off to the clinic's Agent. Simulate a little work so the
-    // span has a realistic duration.
-    await Task.Delay(Random.Shared.Next(5, 40));
-
-    return Results.Json(new { delivered_to_clinic = true, hub_message_id = hubMessageId });
 });
 
 app.MapGet("/healthz", () => Results.Text("ok"));

@@ -1,8 +1,8 @@
 # =============================================================================
-#  Coralogix OpenTelemetry Collector (CDOT) — ECS/EC2 daemon agent
+#  Coralogix OpenTelemetry Collector (CDOT) — ECS Fargate service
 # =============================================================================
-#  Runs as an ECS DAEMON service in networkMode=host, so every application task
-#  on the same EC2 instance can reach it at http://localhost:4318.
+#  Runs as a normal (REPLICA) ECS Fargate service, discoverable by every other
+#  task via ECS Service Connect at http://otel-collector:4318.
 #
 #  This file is the ONLY place where telemetry is shaped. Note especially the
 #  `transform/hub_message_id` processor: it lifts the Ministry of Health
@@ -26,27 +26,28 @@ processors:
     limit_mib: 380
     spike_limit_mib: 90
 
-  # Adds cloud.*, aws.ecs.*, host.* resource attributes so you can slice APM by
-  # cluster / task / instance in Coralogix.
+  # Adds cloud.*, aws.ecs.* resource attributes so you can slice APM by
+  # cluster / task in Coralogix. No `ec2` detector: on Fargate there is no EC2
+  # host to introspect.
   resourcedetection/ecs:
-    detectors: [env, ecs, ec2]
+    detectors: [env, ecs]
     timeout: 5s
     override: false
 
   # ===========================================================================
   #  THE CORRELATION PROCESSOR  —  read this one carefully
   # ===========================================================================
-  #  The BLUE flow and the GREEN flow are asynchronous, so they legitimately get
-  #  DIFFERENT trace IDs. The Ministry of Health joins them on the business GUID
-  #  (`hub_message_id` / `message_id`) from the JSON contract.
+  #  The Ministry of Health identifies every business transaction with a GUID
+  #  (`hub_message_id` / `message_id`) from the JSON contract, independent of
+  #  the OpenTelemetry trace ID.
   #
   #  The applications simply carry that GUID in the request URL (query string).
   #  Every OpenTelemetry auto-instrumentation records the URL on its HTTP spans
   #  for free. So here — in infrastructure config, not application code — we
   #  parse the GUID out of the URL and promote it to `hub.message_id`.
   #
-  #  Result in Coralogix: one search on `hub.message_id` returns the spans of
-  #  BOTH traces, and from there you open each trace in full.
+  #  Result in Coralogix: one search on `hub.message_id` returns every span and
+  #  log line for that business transaction, with zero application code.
   #
   #  We try several attribute names because different language SDKs are on
   #  different HTTP semantic-convention versions.
@@ -68,16 +69,15 @@ processors:
           # (d) legacy semconv, server spans:  http.target
           - 'set(cache["d"], ExtractPatterns(attributes["http.target"], "hub_message_id=(?P<id>[0-9a-fA-F-]{36})")) where attributes["hub.message_id"] == nil and attributes["http.target"] != nil'
           - 'set(attributes["hub.message_id"], cache["d"]["id"]) where attributes["hub.message_id"] == nil and cache["d"] != nil'
-          # Tag which of the two MoH flows the span belongs to, for easy filtering.
-          - 'set(attributes["moh.flow"], "green") where IsMatch(attributes["hub.message_id"], ".") and (IsMatch(name, "(?i)clinic-callback") or IsMatch(name, "(?i)tamar") or IsMatch(name, "(?i)green"))'
-          - 'set(attributes["moh.flow"], "blue") where attributes["moh.flow"] == nil and IsMatch(attributes["hub.message_id"], ".")'
+          # Tag the MoH flow this span belongs to, for easy filtering.
+          - 'set(attributes["moh.flow"], "blue") where IsMatch(attributes["hub.message_id"], ".")'
 
     # Same idea for LOGS. Auto-instrumentation already attached trace_id/span_id
     # to every log record, so once `hub.message_id` is here too you can go
     # GUID -> log -> trace with one click.
     #
     # Two shapes to handle:
-    #  * Python/Node render the GUID into the message text, so we parse the body.
+    #  * Python renders the GUID into the message text, so we parse the body.
     #  * .NET ILogger keeps the message TEMPLATE in the body and puts the
     #    structured parameters in attributes, so we read the attribute directly.
     log_statements:
@@ -86,7 +86,7 @@ processors:
           # .NET structured-logging parameter, e.g.
           #   log.LogInformation("... hub_message_id={hub_message_id}", id)
           - 'set(attributes["hub.message_id"], attributes["hub_message_id"]) where attributes["hub_message_id"] != nil'
-          # Python / Node rendered text
+          # Python rendered text
           - 'set(cache["a"], ExtractPatterns(body, "hub_message_id=(?P<id>[0-9a-fA-F-]{36})")) where attributes["hub.message_id"] == nil and body != nil'
           - 'set(attributes["hub.message_id"], cache["a"]["id"]) where attributes["hub.message_id"] == nil and cache["a"] != nil'
 
@@ -173,7 +173,6 @@ connectors:
       - name: http.request.method
       - name: http.response.status_code
       - name: messaging.system
-      - name: db.system
     metrics_expiration: 5m
     exemplars:
       # Attaches example trace IDs to the metrics, so you can jump from a

@@ -38,7 +38,7 @@ SUBNET=$(aws ec2 describe-subnets --region "$REGION" \
         --query 'Subnets[0].SubnetId' --output text)
 echo "    VpcId=$VPC SubnetId=$SUBNET"
 
-echo "==> 4/4  compute stack (ECS cluster, 1x EC2, 6 services)"
+echo "==> 4/4  compute stack (ECS Fargate cluster, 4 services)"
 aws cloudformation deploy --region "$REGION" \
   --template-file "$ROOT/infra/cloudformation/02-ecs.yaml" \
   --stack-name "${PROJECT}-ecs" \

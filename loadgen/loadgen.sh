@@ -6,19 +6,15 @@
 #  Ministry of Health, so the FIRST span of every trace belongs to the MoH edge
 #  service -- exactly like production, where the clinic is behind your ALB.
 #
-#  It drives both flows:
+#  It drives the BLUE flow:
 #    BLUE  : POST /api/v1/hub/messages   on edge-dotnet
-#    GREEN : POST /tamar/dispatch        on worker-node (stands in for the
-#            RDS-change / EventBridge trigger you will wire in your own infra)
 # =============================================================================
 set -u
 
 EDGE_URL="${EDGE_URL:-http://localhost:8080}"
-GREEN_TRIGGER_URL="${GREEN_TRIGGER_URL:-http://localhost:8082}"
 INTERVAL="${INTERVAL:-10}"          # seconds between BLUE requests
-GREEN_EVERY="${GREEN_EVERY:-3}"     # trigger GREEN every N iterations
 
-echo "loadgen: edge=$EDGE_URL green=$GREEN_TRIGGER_URL interval=${INTERVAL}s"
+echo "loadgen: edge=$EDGE_URL interval=${INTERVAL}s"
 
 # Wait for the edge service to come up before hammering it.
 until curl -sf -o /dev/null "$EDGE_URL/healthz"; do
@@ -35,7 +31,7 @@ while true; do
   NOW=$(date -u +%Y-%m-%dT%H:%M:%S.000+00:00)
   RESEARCH_ID=$((14000 + i % 900))
 
-  # --- BLUE: clinic -> ALB -> API GW -> Lambda -> SQS -> Lambda -> RDS -------
+  # --- BLUE: clinic -> ALB -> API GW -> Lambda -> SQS ------------------------
   # Body shape copied from the real Ministry of Health message contract.
   BODY=$(cat <<JSON
 {
@@ -74,13 +70,6 @@ JSON
     "$EDGE_URL/api/v1/hub/messages?hub_message_id=$HUB_MESSAGE_ID" \
     && echo "BLUE  sent hub_message_id=$HUB_MESSAGE_ID" \
     || echo "BLUE  FAILED hub_message_id=$HUB_MESSAGE_ID"
-
-  # --- GREEN: RDS -> SQS -> Lambda -> F5 API GW -> clinic --------------------
-  if [ $((i % GREEN_EVERY)) -eq 0 ]; then
-    curl -sf -o /dev/null -X POST "$GREEN_TRIGGER_URL/tamar/dispatch" \
-      && echo "GREEN trigger sent" \
-      || echo "GREEN trigger FAILED"
-  fi
 
   sleep "$INTERVAL"
 done
