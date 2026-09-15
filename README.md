@@ -3,7 +3,7 @@
 ## What this guide teaches you
 
 How to get **OpenTelemetry automatic instrumentation** — zero application
-code, zero manual spans — working for **.NET 8** and **Python 3.12** services
+code, zero manual spans — working for **.NET 6** and **Python 3.12** services
 running on **AWS ECS Fargate**, shipping traces, metrics and logs to
 Coralogix with full APM. Everything you need is here: the exact Dockerfile
 changes for each language ([`services/edge-dotnet/Dockerfile`](services/edge-dotnet/Dockerfile),
@@ -42,11 +42,25 @@ name — `http://hub-python:8081`, `http://otel-collector:4318` — instead of
 
 | Your architecture | This repo | Language |
 |---|---|---|
-| AWS ALB + API Gateway (F5) | `edge-dotnet` :8080 | **.NET 8** |
-| BLUE routing Lambda | `hub-python` :8081 | **Python 3.12** |
+| **Sponsor / BackOffice** ECS containers — where tracing starts | `edge-dotnet` :8080 | **.NET 6** |
+| HUB routing Lambdas (all Python) | `hub-python` :8081 | **Python 3.12** |
 | SQS (blue) | `moh-hub-otel-blue` | real SQS |
 | Outpatient clinic (מרפאת חוץ) | `loadgen` | *uninstrumented on purpose* |
 | — | `otel-collector` (ECS **Fargate service**) | Coralogix CDOT |
+
+> **The .NET Lambda on the MoH-infrastructure side** (incl. the green-route
+> path for repeated calls) is instrumented the same way, only packaged
+> differently: attach the OTel/ADOT **Lambda layer** for .NET instead of
+> baking the agent into a Dockerfile, and set `AWS_LAMBDA_EXEC_WRAPPER=/opt/otel-instrument`
+> plus the exact same `OTEL_*` environment variables you see below. Python
+> Lambdas: same story with the Python ADOT layer.
+>
+> **Genericity / Terraform:** nothing in this repo is hand-crafted per
+> service. The entire integration is (a) a fixed block of `OTEL_*`
+> environment variables per task definition, (b) one collector config file,
+> (c) one SSM SecureString for the key. All three translate 1:1 into
+> `aws_ecs_task_definition` / `aws_ssm_parameter` Terraform resources — the
+> CloudFormation in `infra/` is the reference implementation to port.
 
 ### The flow
 
@@ -70,27 +84,32 @@ Each service has **zero** OpenTelemetry code. Look at
 [`services/hub-python/app.py`](services/hub-python/app.py) — no imports, no
 spans. All of it is Dockerfile + environment variables.
 
-### .NET 8 — [`services/edge-dotnet/Dockerfile`](services/edge-dotnet/Dockerfile)
+### .NET 6 — [`services/edge-dotnet/Dockerfile`](services/edge-dotnet/Dockerfile)
 
-Download the agent, then set five environment variables. The CLR profiler
+Download the agent, then set seven environment variables. The CLR profiler
 rewrites IL at JIT time.
 
 ```dockerfile
 ENV OTEL_DOTNET_AUTO_HOME=/otel-dotnet-auto
-RUN curl -sSfL .../otel-dotnet-auto-install.sh -o /tmp/i.sh && sh /tmp/i.sh
+RUN curl -sSfL .../v1.9.0/otel-dotnet-auto-install.sh -o /tmp/i.sh && sh /tmp/i.sh
 
 ENV CORECLR_ENABLE_PROFILING=1
 ENV CORECLR_PROFILER={918728DD-259F-4A6A-AC2B-B85E1B658318}
 ENV CORECLR_PROFILER_PATH=/otel-dotnet-auto/native/OpenTelemetry.AutoInstrumentation.Native.so
 ENV DOTNET_STARTUP_HOOKS=/otel-dotnet-auto/net/OpenTelemetry.AutoInstrumentation.StartupHook.dll
+ENV DOTNET_ADDITIONAL_DEPS=/otel-dotnet-auto/AdditionalDeps   # .NET 6 only
+ENV DOTNET_SHARED_STORE=/otel-dotnet-auto/store               # .NET 6 only
 ```
 
 Gives you: ASP.NET Core server spans, `HttpClient` client spans (with automatic
 `traceparent` injection), `ILogger` records over OTLP, and runtime metrics.
 
-> The agent's own `instrument.sh` exports exactly these. We set them explicitly
-> so you can see what is required. **Note:** `DOTNET_ADDITIONAL_DEPS` and
-> `DOTNET_SHARED_STORE` appear in older docs — v1.16 no longer uses them.
+> **Version pin matters on .NET 6:** agent **v1.9.0 is the last release that
+> supports .NET 6/7** — v1.10.0 removed them after their end of support. On
+> .NET 6 the agent also needs `DOTNET_ADDITIONAL_DEPS` + `DOTNET_SHARED_STORE`
+> (that is how it injects its updated `System.Diagnostics.DiagnosticSource`
+> into the app); on .NET 8+ with agent v1.10+ those two vars are gone and you
+> set only the first four. Application code is identical either way.
 
 ### Python 3.12 — [`services/hub-python/Dockerfile`](services/hub-python/Dockerfile)
 

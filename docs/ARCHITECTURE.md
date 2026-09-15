@@ -7,7 +7,7 @@
                         │                                                      │
    מרפאת חוץ            │   edge-dotnet          hub-python                   │
    (outpatient clinic)  │   ALB + API GW         routing λ                    │
-        │               │   [.NET 8]             [Python 3.12]                │
+        │               │   [.NET 6]             [Python 3.12]                │
         │  BLUE         │       │                     │                       │
         └───── HTTP ────┼──────▶│──── HTTP ──────────▶│──── SQS(blue) ──▶     │
                         │       │                     │                       │
