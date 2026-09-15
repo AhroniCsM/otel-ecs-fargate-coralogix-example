@@ -51,6 +51,10 @@ services:
     environment:
       <<: *otel-common
       OTEL_SERVICE_NAME: edge-dotnet
+      # Without these, the .NET agent replaces query-string values with the
+      # literal "Redacted" and the hub_message_id GUID never reaches Coralogix.
+      OTEL_DOTNET_EXPERIMENTAL_ASPNETCORE_DISABLE_URL_QUERY_REDACTION: 'true'
+      OTEL_DOTNET_EXPERIMENTAL_HTTPCLIENT_DISABLE_URL_QUERY_REDACTION: 'true'
       HUB_ROUTER_URL: http://hub-python:8081
     ports: ['8080:8080']
 

@@ -224,6 +224,15 @@ Resources:
               Value: always_on
             - Name: OTEL_PROPAGATORS
               Value: tracecontext,baggage
+            # The .NET agent REDACTS query-string values by default (they
+            # become the literal "Redacted"), which would strip the
+            # hub_message_id GUID off every span URL before the collector can
+            # promote it. The GUID is a business correlation id, not a secret,
+            # so we opt out for both the server and client instrumentations.
+            - Name: OTEL_DOTNET_EXPERIMENTAL_ASPNETCORE_DISABLE_URL_QUERY_REDACTION
+              Value: 'true'
+            - Name: OTEL_DOTNET_EXPERIMENTAL_HTTPCLIENT_DISABLE_URL_QUERY_REDACTION
+              Value: 'true'
             # ---- application config ---------------------------------------
             # CUSTOMER: in your infra this is your internal API GW / Lambda URL.
             - Name: HUB_ROUTER_URL

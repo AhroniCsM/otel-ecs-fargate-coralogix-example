@@ -111,6 +111,41 @@ Gives you: ASP.NET Core server spans, `HttpClient` client spans (with automatic
 > into the app); on .NET 8+ with agent v1.10+ those two vars are gone and you
 > set only the first four. Application code is identical either way.
 
+### Troubleshooting .NET 6 — every real-world failure mode, mapped
+
+These are actual errors hit while instrumenting a production .NET 6.0.36
+service on ECS with an init-container that downloads the agent into a shared
+volume. Each one has a specific cause. The Dockerfile in this repo is the
+combination that works; use this table when your variation of it doesn't.
+
+| Error you see | Agent | Cause | Fix |
+|---|---|---|---|
+| `Rule Engine: MinSupportedFrameworkVersionValidator ... '6.0.36 is not supported'` | v1.16.0, v1.10.0 | Agent v1.10.0+ removed .NET 6/7 support (EOL) | Pin **v1.9.0** — the last version that supports .NET 6 |
+| App exits **code 139 (SIGSEGV)** with `CORECLR_*` set | v1.9.0 | The native profiler `.so` doesn't match the container: **x64 agent in an arm64 task (or vice versa)**, or a **glibc build in an Alpine/musl image**. Typical with init-container downloads where the download logic picks the wrong build | Match `CORECLR_PROFILER_PATH` to the app image's arch/libc (`linux-x64` / `linux-arm64` / `linux-musl-*`). Baking the install into the app image (as here) makes this impossible to get wrong — the install script runs on the target image itself |
+| App healthy, **zero telemetry**; agent log shows `CLR profiler was not correctly loaded into the process` + `Rule 'Native profiler diagnoser' failed` | v1.9.0 on **arm64** | **Measured on this exact lab:** the v1.9.0 `linux-arm64` native profiler links against **glibc 2.32–2.35** (built on Ubuntu 22.04), but every default .NET 6 image is Debian 11 "bullseye" = **glibc 2.31**. `dlopen` fails, the rule engine aborts, and the agent disables itself *completely* — including the managed part. `ldd OpenTelemetry.AutoInstrumentation.Native.so` inside the container shows the missing `GLIBC_2.3x` symbols. x64 profiler builds target an older glibc and don't hit this | Use the **`-jammy`** base images (`sdk:6.0-jammy`, `aspnet:6.0-jammy` — Ubuntu 22.04, glibc 2.35), as this repo's Dockerfile does. The Dockerfile also runs `ldd` on the `.so` at **build time**, so an incompatible base fails the build instead of silently shipping an uninstrumented app |
+| `MissingMethodException: ...LoggingBuilderExtensions.AddConfiguration(...)` at `WebApplication.CreateBuilder` | v1.9.0, startup-hook only | `DOTNET_ADDITIONAL_DEPS` is set but the **shared store contents don't match** — partial copy, wrong layout, or `DOTNET_SHARED_STORE` pointing at the wrong root. The runtime then binds 8.0.0 deps entries against assemblies it can't find, poisoning the default load context | Ship `AdditionalDeps/` and `store/` **exactly as unpacked** by the agent installer and point both vars at them. Never copy selectively; the store layout (`store/<arch>/<tfm>/...`) must survive intact |
+| `Error in StartupHook initialization ... TypeInitializationException ... Loader` (or `FileNotFoundException: Microsoft.Extensions.Logging.Abstractions, Version=8.0.0.0`) | v1.9.0, no deps/store | On .NET 6 the agent's Loader depends on `Microsoft.Extensions.Logging.Abstractions 8.0.0.0`, which .NET 6 doesn't have. `DOTNET_ADDITIONAL_DEPS` + `DOTNET_SHARED_STORE` are **how it gets injected** — they are *required* on .NET 6, not optional | Set both vars (see Dockerfile). This is the single most common .NET 6 mistake |
+| Log shows a mangled path like `LoaderFolderLocation: /otel-auto-instrumentation/net?` | any | A stray character (CRLF, quote, `?`) in the env-var value — usually from copy-pasting into a task-definition JSON | Re-type the values; diff against the six `ENV` lines in this repo's Dockerfile |
+| Traces arrive but the URL query values on .NET spans read `hub_message_id=Redacted` — the GUID never lands on the span | any | The .NET instrumentation **redacts query-string values by default** (privacy). Your correlation GUID travels in the query string, so it's scrubbed before the collector ever sees it | Set `OTEL_DOTNET_EXPERIMENTAL_ASPNETCORE_DISABLE_URL_QUERY_REDACTION=true` and `OTEL_DOTNET_EXPERIMENTAL_HTTPCLIENT_DISABLE_URL_QUERY_REDACTION=true` on the .NET task (see `02-ecs.yaml`) — justified here because the GUID is a business id, not a secret |
+| Everything boots, agent log says `MinSupportedFrameworkRule evaluation success`, still no traces | v1.9.0 | The agent is fine — the problem is downstream (collector unreachable, wrong key, or stale ECS Service Connect endpoints) | See the Service Connect note below and the collector section |
+
+Two more things worth knowing:
+
+* **How to verify the agent attached** before blaming anything else: the agent
+  writes `/var/log/opentelemetry/dotnet/*.log` inside the container. A healthy
+  .NET 6 startup shows `MinSupportedFrameworkRule evaluation success` plus a
+  *warning* that .NET 6 is EOL — the warning is expected and harmless on v1.9.0.
+* **If the native profiler still crashes** in your environment, v1.9.0 also
+  works **managed-only**: drop the three `CORECLR_*` vars and keep
+  `DOTNET_STARTUP_HOOKS` + `DOTNET_ADDITIONAL_DEPS` + `DOTNET_SHARED_STORE`.
+  You keep ASP.NET Core, HttpClient and ILogger instrumentation (they are
+  source-based); you lose only byte-code instrumentations (e.g. `SqlClient`).
+* **ECS Service Connect gotcha:** if you ever replace the collector service's
+  task, **force a new deployment of the client services too** — client tasks
+  wire their Service Connect proxy at start, and a client started against the
+  old collector task can keep pointing at a dead endpoint while looking
+  perfectly healthy.
+
 ### Python 3.12 — [`services/hub-python/Dockerfile`](services/hub-python/Dockerfile)
 
 One pip package, one command prefix.
