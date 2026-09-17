@@ -126,8 +126,44 @@ combination that works; use this table when your variation of it doesn't.
 | `MissingMethodException: ...LoggingBuilderExtensions.AddConfiguration(...)` at `WebApplication.CreateBuilder` | v1.9.0, startup-hook only | `DOTNET_ADDITIONAL_DEPS` is set but the **shared store contents don't match** — partial copy, wrong layout, or `DOTNET_SHARED_STORE` pointing at the wrong root. The runtime then binds 8.0.0 deps entries against assemblies it can't find, poisoning the default load context | Ship `AdditionalDeps/` and `store/` **exactly as unpacked** by the agent installer and point both vars at them. Never copy selectively; the store layout (`store/<arch>/<tfm>/...`) must survive intact |
 | `Error in StartupHook initialization ... TypeInitializationException ... Loader` (or `FileNotFoundException: Microsoft.Extensions.Logging.Abstractions, Version=8.0.0.0`) | v1.9.0, no deps/store | On .NET 6 the agent's Loader depends on `Microsoft.Extensions.Logging.Abstractions 8.0.0.0`, which .NET 6 doesn't have. `DOTNET_ADDITIONAL_DEPS` + `DOTNET_SHARED_STORE` are **how it gets injected** — they are *required* on .NET 6, not optional | Set both vars (see Dockerfile). This is the single most common .NET 6 mistake |
 | Log shows a mangled path like `LoaderFolderLocation: /otel-auto-instrumentation/net?` | any | A stray character (CRLF, quote, `?`) in the env-var value — usually from copy-pasting into a task-definition JSON | Re-type the values; diff against the six `ENV` lines in this repo's Dockerfile |
+| A **third-party library** blows up at startup with a nested `TypeInitializationException` → `...OpenTelemetry.AutoInstrumentation.Loader.Loader...` → `FileNotFoundException: System.Diagnostics.DiagnosticSource, Version=8.0.0.0` (seen with IronPDF's license warmup) | v1.9.0 | The library is a **bystander**: it triggered an `AssemblyResolve` event, the agent's Loader initialized lazily inside that event, and the Loader died because `DOTNET_ADDITIONAL_DEPS` is missing (`DOTNET_SHARED_STORE` alone does nothing). The library's own assembly load then fails as collateral damage | Set **both** vars — or, for dependency-heavy apps where AdditionalDeps itself causes conflicts, use the app-local alternative below |
 | Traces arrive but the URL query values on .NET spans read `hub_message_id=Redacted` — the GUID never lands on the span | any | The .NET instrumentation **redacts query-string values by default** (privacy). Your correlation GUID travels in the query string, so it's scrubbed before the collector ever sees it | Set `OTEL_DOTNET_EXPERIMENTAL_ASPNETCORE_DISABLE_URL_QUERY_REDACTION=true` and `OTEL_DOTNET_EXPERIMENTAL_HTTPCLIENT_DISABLE_URL_QUERY_REDACTION=true` on the .NET task (see `02-ecs.yaml`) — justified here because the GUID is a business id, not a secret |
 | Everything boots, agent log says `MinSupportedFrameworkRule evaluation success`, still no traces | v1.9.0 | The agent is fine — the problem is downstream (collector unreachable, wrong key, or stale ECS Service Connect endpoints) | See the Service Connect note below and the collector section |
+
+#### Dependency-heavy apps (Umbraco, IronPDF, …): the app-local alternative to AdditionalDeps
+
+`DOTNET_ADDITIONAL_DEPS` + `DOTNET_SHARED_STORE` inject the agent's 8.0
+assemblies at the **host level**, process-wide, with no NuGet mediation. On a
+minimal app that's clean. On an app that pins dozens of 6.x
+`Microsoft.Extensions.*` packages (an Umbraco site, say), the host-level merge
+can produce a mixed 6.x/8.0 assembly set and the app dies at
+`WebApplication.CreateBuilder` with `MissingMethodException` — while removing
+the two vars kills the agent's Loader instead (the table above). Both paths
+lose.
+
+**The verified way out: move the resolution from the host to NuGet.** Delete
+both env vars (`DOTNET_ADDITIONAL_DEPS` *and* `DOTNET_SHARED_STORE`) and add
+three references to the application project:
+
+```xml
+<ItemGroup>
+  <!-- Exactly the closure the agent's AdditionalDeps would have injected,
+       but resolved by NuGet at build time, so conflicts with the rest of
+       your dependency graph surface as restore warnings instead of runtime
+       crashes. All three target net6.0. -->
+  <PackageReference Include="System.Diagnostics.DiagnosticSource" Version="8.0.1" />
+  <PackageReference Include="Microsoft.Extensions.Logging.Configuration" Version="8.0.1" />
+  <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="8.0.1" />
+</ItemGroup>
+```
+
+These three pull, app-locally, the exact 12-package closure the agent's store
+ships (`Logging` chain, `Options`, `Configuration` + `Binder`, `Primitives`,
+`DiagnosticSource`). Verified on this repo's edge service: with the three
+references and **no** deps/store vars, the agent logs
+`StartupHook initialized successfully` and exports spans + ILogger records
+normally. Keep `DOTNET_STARTUP_HOOKS` (and the `CORECLR_*` trio if you want
+byte-code instrumentations); everything else in the Dockerfile stays the same.
 
 Two more things worth knowing:
 
