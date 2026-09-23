@@ -2,6 +2,7 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 boto3==1.35.90
+psycopg[binary]==3.2.3
 
 # --- OpenTelemetry AUTO instrumentation ------------------------------------
 # `opentelemetry-distro` gives you the `opentelemetry-instrument` launcher.
@@ -13,3 +14,9 @@ opentelemetry-exporter-otlp==1.29.0
 opentelemetry-instrumentation-fastapi==0.50b0
 opentelemetry-instrumentation-botocore==0.50b0
 opentelemetry-instrumentation-logging==0.50b0
+# DB client spans (db.system/db.name/db.statement) -> drives the Coralogix
+# Database Catalog via the collector's spanmetrics/db connector.
+# GOTCHA: use psycopg v3 (package name `psycopg`). The psycopg2 instrumentation
+# declares a dependency on the SOURCE package `psycopg2` and SILENTLY skips
+# apps that install `psycopg2-binary` -- queries work, spans never appear.
+opentelemetry-instrumentation-psycopg==0.50b0

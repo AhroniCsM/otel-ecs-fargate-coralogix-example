@@ -376,21 +376,39 @@ config (no application change) do:
 
 **1. Span metrics** — the `spanmetrics` connector derives RED metrics from the
 spans you are already sending, which is what drives the APM latency, throughput
-and error-rate charts. Verified live:
+and error-rate charts.
 
-```
-$ cx metrics query 'sum by (service_name) (increase(traces_span_metrics_calls_total[10m]))'
-  "edge-dotnet","153"
-  "hub-python","255"
-```
+> **The metric NAMES matter.** The Coralogix APM UI queries `calls_total`,
+> `duration_ms_*` and `db_calls_total` — the names the official
+> `otel-integration` Helm chart produces. The spanmetrics connector's
+> *default* namespace prefixes everything (`traces_span_metrics_calls_total`),
+> and with those names **the APM screens stay empty even though the data is
+> "in Coralogix"**. This repo's collector config sets `namespace: ""` (and
+> `namespace: db` for the db connector) and copies the chart's dimension list
+> verbatim (`cgx.transaction`, `http.method`, `db.*`, `service.version`, ...),
+> so the APM Service Catalog gets exactly what it expects.
 
-The metric family Coralogix receives is:
+The metric families Coralogix receives:
 
 | Metric | Use |
 |---|---|
-| `traces_span_metrics_calls_total` | throughput + error rate |
-| `traces_span_metrics_duration_ms_bucket` | latency percentiles |
-| `traces_span_metrics_duration_ms_count` / `_sum` | averages |
+| `calls_total` | APM throughput + error rate |
+| `duration_ms_bucket` / `_count` / `_sum` | APM latency percentiles |
+| `db_calls_total`, `db_duration_ms_*` | **Database Catalog** (see below) |
+
+**1b. Database Catalog** — DB **client** spans (here: psycopg2 auto-instrumented
+Postgres calls in `hub-python`, see [`services/hub-python/app.py`](services/hub-python/app.py))
+flow through a dedicated collector pipeline: `filter/db_spanmetrics` keeps only
+spans carrying `db.system`, `transform/db` normalises old/new database
+semantic conventions (`db.name`→`db.namespace`, `db.operation`→`db.operation.name`),
+and the `spanmetrics/db` connector emits the `db_calls_total` family with the
+`db.system` / `db.namespace` / `db.operation.name` / `db.collection.name`
+dimensions the Database Catalog is built on.
+
+**1c. APM Transactions** — the `coralogix` processor stamps
+`cgx.transaction` / `cgx.transaction.root` onto every span, but **only if
+`groupbytrace` runs immediately before it** so it sees whole traces; that
+ordering comes straight from the official chart and is easy to miss.
 
 > **Cost warning, and it matters.** Every `dimensions:` entry multiplies the
 > time-series count. The dimensions here (`http.request.method`,

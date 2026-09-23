@@ -44,6 +44,14 @@ Parameters:
       Name of the SSM Parameter Store SecureString holding your Coralogix
       Send-Your-Data API key. The key itself is never in this template or in git.
 
+  # Demo-only credential for the throwaway audit database. The DB holds no
+  # real data, lives on an ephemeral Fargate task (gone on restart) and is
+  # reachable only from tasks in the same security group.
+  PostgresPassword:
+    Type: String
+    Default: mohhub-demo-only
+    NoEcho: true
+
 Resources:
 
   # ===========================================================================
@@ -330,6 +338,16 @@ Resources:
             - Name: BLUE_QUEUE_URL
               Value: !ImportValue
                 Fn::Sub: '${ProjectName}-blue-queue-url'
+            # Postgres audit trail -> DB CLIENT spans -> Coralogix Database
+            # Catalog (db_calls_total & friends via the collector).
+            - Name: PG_HOST
+              Value: postgres
+            - Name: PG_USER
+              Value: moh
+            - Name: PG_PASSWORD
+              Value: !Ref PostgresPassword
+            - Name: PG_DB
+              Value: mohhub
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -360,6 +378,73 @@ Resources:
             ClientAliases:
               - Port: 8081
                 DnsName: hub-python
+
+  # ===========================================================================
+  #  TASK DEFINITION 3.5 - postgres   (the audit database)
+  # ===========================================================================
+  #  Exists so the demo has real DB CLIENT spans -> Coralogix DATABASE CATALOG.
+  #  Ephemeral by design: no volume, data gone on task restart, demo password,
+  #  reachable only from tasks in the same security group.
+  #  CUSTOMER: your real databases replace this; nothing else changes.
+  PostgresTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-postgres'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: '256'
+      Memory: '512'
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: '${ProjectName}-exec-role'
+      ContainerDefinitions:
+        - Name: postgres
+          # Pulled from Amazon's public ECR mirror - no Docker Hub rate limits.
+          Image: public.ecr.aws/docker/library/postgres:16-alpine
+          Essential: true
+          Memory: 448
+          PortMappings:
+            - ContainerPort: 5432
+              Name: postgres
+          Environment:
+            - Name: POSTGRES_USER
+              Value: moh
+            - Name: POSTGRES_PASSWORD
+              Value: !Ref PostgresPassword
+            - Name: POSTGRES_DB
+              Value: mohhub
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !ImportValue
+                Fn::Sub: '${ProjectName}-log-group'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: postgres
+
+  PostgresService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: postgres
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref PostgresTaskDef
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref SubnetId]
+          SecurityGroups: [!Ref TaskSecurityGroup]
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: !GetAtt Namespace.Arn
+        Services:
+          - PortName: postgres
+            DiscoveryName: postgres
+            ClientAliases:
+              - Port: 5432
+                DnsName: postgres
 
   # ===========================================================================
   #  TASK DEFINITION 4 - loadgen   (always-on demo traffic)

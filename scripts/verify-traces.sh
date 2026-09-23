@@ -34,8 +34,12 @@ run "5. Logs carry the same GUID + trace id (log -> trace pivot)" \
   logs "filter \$l.applicationname == '$APP' && \$d.attributes['hub_message_id'] != null | choose \$l.subsystemname as svc, \$d.attributes['hub_message_id'] as hub_message_id, \$d.attributes['otelTraceID'] as trace_id, \$d.body as body | limit 5" \
   --start "$WINDOW" -o agents
 
-run "6. APM RED metrics derived from the spans (span metrics connector)" \
-  metrics query "sum by (service_name) (increase(traces_span_metrics_calls_total{service_name=~'edge-dotnet|hub-python'}[10m]))" \
+run "6. APM RED metrics (calls_total — the name the APM UI queries)" \
+  metrics query "sum by (service_name) (increase(calls_total{service_name=~'edge-dotnet|hub-python'}[10m]))" \
+  -o agents
+
+run "6b. DATABASE CATALOG metrics (db_calls_total from the postgres spans)" \
+  metrics query "sum by (service_name, db_system, db_namespace, db_operation_name) (increase(db_calls_total[10m]))" \
   -o agents
 
 run "7. Environment facet (deployment.environment.name)" \

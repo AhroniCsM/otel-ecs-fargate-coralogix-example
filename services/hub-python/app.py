@@ -19,6 +19,7 @@ import os
 import uuid
 
 import boto3
+import psycopg                       # v3; auto-instrumented -> DB CLIENT spans
 from fastapi import FastAPI, Request
 
 # ---------------------------------------------------------------------------
@@ -26,6 +27,49 @@ from fastapi import FastAPI, Request
 # ---------------------------------------------------------------------------
 AWS_REGION     = os.environ.get("AWS_REGION", "eu-north-1")
 BLUE_QUEUE_URL = os.environ["BLUE_QUEUE_URL"]     # SQS queue for the BLUE flow
+
+# Postgres audit trail — this is what lights up the Coralogix DATABASE CATALOG.
+# psycopg (v3) is auto-instrumented by `opentelemetry-instrument`, so every INSERT/
+# SELECT below becomes a DB CLIENT span (db.system=postgresql, db.name,
+# db.statement) with zero OpenTelemetry code. Unset PG_HOST to disable.
+PG_HOST     = os.environ.get("PG_HOST")           # e.g. "postgres" (Service Connect)
+PG_USER     = os.environ.get("PG_USER", "moh")
+PG_PASSWORD = os.environ.get("PG_PASSWORD", "")
+PG_DB       = os.environ.get("PG_DB", "mohhub")
+_pg_ready   = False
+
+
+def _pg_conn():
+    return psycopg.connect(host=PG_HOST, port=5432, user=PG_USER,
+                           password=PG_PASSWORD, dbname=PG_DB, connect_timeout=3)
+
+
+def _audit_message(hub_message_id: str, message_id: str) -> int:
+    """INSERT the routed message + SELECT the running total.
+
+    Two real queries per transaction so the Database Catalog shows both an
+    INSERT and a SELECT operation. Table creation is lazy so the demo never
+    needs a migration step.
+    """
+    global _pg_ready
+    conn = _pg_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            if not _pg_ready:
+                cur.execute("""CREATE TABLE IF NOT EXISTS hub_messages (
+                                 id SERIAL PRIMARY KEY,
+                                 hub_message_id UUID NOT NULL,
+                                 message_id UUID NOT NULL,
+                                 routed_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
+                _pg_ready = True
+            cur.execute(
+                "INSERT INTO hub_messages (hub_message_id, message_id) VALUES (%s, %s)",
+                (hub_message_id, message_id),
+            )
+            cur.execute("SELECT count(*) FROM hub_messages")
+            return cur.fetchone()[0]
+    finally:
+        conn.close()
 
 # GOTCHA WORTH KNOWING: under `opentelemetry-instrument` the OTLP LoggingHandler
 # is already attached to the root logger before your code runs, so
@@ -78,6 +122,17 @@ async def process(request: Request):
         },
         "data": payload.get("data", {}),
     }
+
+    # Postgres audit trail (Database Catalog). Failure is logged, never fatal —
+    # the demo keeps routing even if the DB is down or PG_HOST is unset.
+    if PG_HOST:
+        try:
+            total = _audit_message(hub_message_id, message_id)
+            log.info("BLUE 2/2 audited to postgres hub_message_id=%s total_rows=%s",
+                     hub_message_id, total)
+        except Exception as exc:  # noqa: BLE001 - demo resilience
+            log.warning("postgres audit failed hub_message_id=%s err=%s",
+                        hub_message_id, exc)
 
     # botocore auto-instrumentation creates the SQS producer span here.
     # We also put the GUID in a MessageAttribute so that (a) the consumer can

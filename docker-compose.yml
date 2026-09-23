@@ -76,7 +76,22 @@ services:
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?set AWS_SECRET_ACCESS_KEY}
       AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
       BLUE_QUEUE_URL: ${BLUE_QUEUE_URL:?set BLUE_QUEUE_URL}
+      # Postgres audit trail -> DB CLIENT spans -> Database Catalog.
+      PG_HOST: postgres
+      PG_USER: moh
+      PG_PASSWORD: mohhub-demo-only
+      PG_DB: mohhub
     ports: ['8081:8081']
+
+  # -------------------------------------------------------------------------
+  #  The audit database (Database Catalog demo). Ephemeral, demo credentials.
+  # -------------------------------------------------------------------------
+  postgres:
+    image: public.ecr.aws/docker/library/postgres:16-alpine
+    environment:
+      POSTGRES_USER: moh
+      POSTGRES_PASSWORD: mohhub-demo-only
+      POSTGRES_DB: mohhub
 
   # -------------------------------------------------------------------------
   #  Always-on traffic. Uninstrumented on purpose (it is "the clinic").

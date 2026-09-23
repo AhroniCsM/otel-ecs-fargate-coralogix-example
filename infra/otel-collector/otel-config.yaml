@@ -4,10 +4,18 @@
 #  Runs as a normal (REPLICA) ECS Fargate service, discoverable by every other
 #  task via ECS Service Connect at http://otel-collector:4318.
 #
-#  This file is the ONLY place where telemetry is shaped. Note especially the
-#  `transform/hub_message_id` processor: it lifts the Ministry of Health
-#  business GUID onto the span as a first-class attribute WITHOUT any of the
-#  applications writing a single line of OpenTelemetry code.
+#  The span-metrics / transactions / db-metrics configuration below is a
+#  faithful port of what the official Coralogix `otel-integration` Helm chart
+#  generates for Kubernetes (rendered from the chart and adapted for ECS), so
+#  the metric names and dimensions are EXACTLY what the Coralogix APM UI
+#  (Service Catalog, Transactions, Database Catalog) queries:
+#
+#    calls_total, duration_ms_bucket/_sum/_count      <- APM RED metrics
+#    db_calls_total, db_duration_ms_bucket/_sum/_count <- Database Catalog
+#
+#  NOTE the namespace: "" on the spanmetrics connector. Without it the
+#  connector prefixes everything (traces_span_metrics_calls_total) and the
+#  APM UI, which queries `calls_total`, stays empty.
 # =============================================================================
 
 receivers:
@@ -27,94 +35,100 @@ processors:
     spike_limit_mib: 90
 
   # Adds cloud.*, aws.ecs.* resource attributes so you can slice APM by
-  # cluster / task in Coralogix. Deliberately omits the `ec2` detector (an
-  # available detector in this OTel component we don't use, since Fargate
-  # tasks have no EC2 host to introspect).
+  # cluster / task in Coralogix.
   resourcedetection/ecs:
     detectors: [env, ecs]
     timeout: 5s
     override: false
 
   # ===========================================================================
-  #  THE CORRELATION PROCESSOR  —  read this one carefully
-  # ===========================================================================
-  #  The Ministry of Health identifies every business transaction with a GUID
-  #  (`hub_message_id` / `message_id`) from the JSON contract, independent of
-  #  the OpenTelemetry trace ID.
-  #
-  #  The applications simply carry that GUID in the request URL (query string).
-  #  Every OpenTelemetry auto-instrumentation records the URL on its HTTP spans
-  #  for free. So here — in infrastructure config, not application code — we
-  #  parse the GUID out of the URL and promote it to `hub.message_id`.
-  #
-  #  Result in Coralogix: one search on `hub.message_id` returns every span and
-  #  log line for that business transaction, with zero application code.
-  #
-  #  We try several attribute names because different language SDKs are on
-  #  different HTTP semantic-convention versions.
+  #  THE CORRELATION PROCESSOR — promotes the MoH business GUID from the
+  #  request URL onto every span and log record. See README.
   # ===========================================================================
   transform/hub_message_id:
     error_mode: ignore
     trace_statements:
       - context: span
         statements:
-          # (a) stable semconv, client spans:  url.full
           - 'set(cache["a"], ExtractPatterns(attributes["url.full"], "hub_message_id=(?P<id>[0-9a-fA-F-]{36})")) where attributes["url.full"] != nil'
           - 'set(attributes["hub.message_id"], cache["a"]["id"]) where cache["a"] != nil'
-          # (b) stable semconv, server spans:  url.query
           - 'set(cache["b"], ExtractPatterns(attributes["url.query"], "hub_message_id=(?P<id>[0-9a-fA-F-]{36})")) where attributes["hub.message_id"] == nil and attributes["url.query"] != nil'
           - 'set(attributes["hub.message_id"], cache["b"]["id"]) where attributes["hub.message_id"] == nil and cache["b"] != nil'
-          # (c) legacy semconv, client spans:  http.url
           - 'set(cache["c"], ExtractPatterns(attributes["http.url"], "hub_message_id=(?P<id>[0-9a-fA-F-]{36})")) where attributes["hub.message_id"] == nil and attributes["http.url"] != nil'
           - 'set(attributes["hub.message_id"], cache["c"]["id"]) where attributes["hub.message_id"] == nil and cache["c"] != nil'
-          # (d) legacy semconv, server spans:  http.target
           - 'set(cache["d"], ExtractPatterns(attributes["http.target"], "hub_message_id=(?P<id>[0-9a-fA-F-]{36})")) where attributes["hub.message_id"] == nil and attributes["http.target"] != nil'
           - 'set(attributes["hub.message_id"], cache["d"]["id"]) where attributes["hub.message_id"] == nil and cache["d"] != nil'
-          # Tag the MoH flow this span belongs to, for easy filtering.
           - 'set(attributes["moh.flow"], "blue") where IsMatch(attributes["hub.message_id"], ".")'
-
-    # Same idea for LOGS. Auto-instrumentation already attached trace_id/span_id
-    # to every log record, so once `hub.message_id` is here too you can go
-    # GUID -> log -> trace with one click.
-    #
-    # Two shapes to handle:
-    #  * Python renders the GUID into the message text, so we parse the body.
-    #  * .NET ILogger keeps the message TEMPLATE in the body and puts the
-    #    structured parameters in attributes, so we read the attribute directly.
     log_statements:
       - context: log
         statements:
-          # .NET structured-logging parameter, e.g.
-          #   log.LogInformation("... hub_message_id={hub_message_id}", id)
           - 'set(attributes["hub.message_id"], attributes["hub_message_id"]) where attributes["hub_message_id"] != nil'
-          # Python rendered text
           - 'set(cache["a"], ExtractPatterns(body, "hub_message_id=(?P<id>[0-9a-fA-F-]{36})")) where attributes["hub.message_id"] == nil and body != nil'
           - 'set(attributes["hub.message_id"], cache["a"]["id"]) where attributes["hub.message_id"] == nil and cache["a"] != nil'
 
+  # Bridge new/old HTTP semconv so the spanmetrics dimensions (http.method,
+  # http.response.status_code) populate regardless of agent generation.
+  # (Verbatim from the Coralogix otel-integration chart.)
+  transform/semconv:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          - 'set(span.attributes["http.method"], span.attributes["http.request.method"]) where span.attributes["http.request.method"] != nil'
+          - 'set(span.attributes["http.response.status_code"], span.attributes["http.status_code"]) where span.attributes["http.response.status_code"] == nil and span.attributes["http.status_code"] != nil'
+
   # ===========================================================================
-  #  APM TRANSACTION DETECTION  —  required for the full APM experience
+  #  APM TRANSACTION DETECTION — cgx.transaction / cgx.transaction.root
   # ===========================================================================
-  #  Without this processor you get traces, but Coralogix APM cannot group them
-  #  into business transactions: the `cgx.transaction` and
-  #  `cgx.transaction.root` span attributes are missing, and the APM
-  #  Transactions / Service Catalog views stay empty.
-  #  It walks each trace, picks the entry-point span, and stamps the whole
-  #  trace with the transaction name.
-  #
-  #  NOTE: `transactions.enabled` defaults to FALSE. `coralogix: {}` validates
-  #  happily and does nothing at all -- you get no error, just permanently empty
-  #  APM Transaction views. You must switch it on explicitly.
-  #  STATUS (verified on CDOT v0.5.13/0.5.15): this processor loads and logs
-  #  "Development component. May change in the future.", but did NOT populate
-  #  `cgx.transaction` / `cgx.transaction.root` in our testing -- with or
-  #  without a `groupbytrace` processor in front of it to batch whole traces.
-  #  Everything else in APM works without it (service catalog, RED metrics,
-  #  latency, service map, error rates all come from the spans and the span
-  #  metrics below). Only the APM *Transactions* grouping view depends on it.
-  #  Left configured and switched on; revisit on a newer CDOT release.
+  #  The coralogix processor stamps each span with its transaction name, which
+  #  the APM Transactions view and the cgx.* span-metric dimensions rely on.
+  #  IT ONLY WORKS ON WHOLE TRACES: groupbytrace must run immediately before
+  #  it so the processor sees every span of a trace in one batch. (This
+  #  ordering is exactly what the official chart does; without groupbytrace
+  #  the cgx.* attributes never populate.)
+  groupbytrace/transactions:
+    wait_duration: 30s
   coralogix:
     transactions:
       enabled: true
+
+  # Only database CLIENT spans may feed the db spanmetrics connector.
+  # (Verbatim from the chart: drop spans with no db.system[.name].)
+  filter/db_spanmetrics:
+    traces:
+      span:
+        - 'attributes["db.system"] == nil and attributes["db.system.name"] == nil'
+
+  # Normalise db semconv across agent generations so the Database Catalog
+  # dimensions (db.namespace / db.operation.name / db.collection.name) are
+  # populated whether the agent emits OLD (db.name, db.operation, db.sql.table)
+  # or NEW (db.namespace, db.system.name, ...) attribute names.
+  transform/db:
+    error_mode: silent
+    trace_statements:
+      - context: span
+        statements:
+          # chart-verbatim: new -> old for db.system
+          - 'set(attributes["db.system"], attributes["db.system.name"]) where attributes["db.system.name"] != nil and attributes["db.system"] == nil'
+          # old -> new, for agents on old db semconv (e.g. Python 0.50b psycopg2)
+          - 'set(attributes["db.namespace"], attributes["db.name"]) where attributes["db.namespace"] == nil and attributes["db.name"] != nil'
+          - 'set(attributes["db.operation.name"], attributes["db.operation"]) where attributes["db.operation.name"] == nil and attributes["db.operation"] != nil'
+          - 'set(attributes["db.collection.name"], attributes["db.sql.table"]) where attributes["db.collection.name"] == nil and attributes["db.sql.table"] != nil'
+          # dbapi-style instrumentations name the span after the SQL verb but
+          # set no db.operation attribute -- promote the span name so the
+          # db.operation.name dimension (Database Catalog "Operations") fills.
+          - 'set(attributes["db.operation.name"], name) where attributes["db.operation.name"] == nil and attributes["db.system"] != nil'
+
+  # Maps the spanmetrics connector's otel.status_code datapoint attribute to
+  # the status.code label the Coralogix APM UI expects. (Chart-verbatim.)
+  transform/spanmetrics:
+    error_mode: silent
+    metric_statements:
+      - context: datapoint
+        statements:
+          - 'set(datapoint.attributes["status.code"], "STATUS_CODE_ERROR") where datapoint.attributes["status.code"] == nil and instrumentation_scope.name == "spanmetricsconnector" and datapoint.attributes["otel.status_code"] == "ERROR"'
+          - 'set(datapoint.attributes["status.code"], "STATUS_CODE_OK") where datapoint.attributes["status.code"] == nil and instrumentation_scope.name == "spanmetricsconnector" and datapoint.attributes["otel.status_code"] == "OK"'
+          - 'set(datapoint.attributes["status.code"], "STATUS_CODE_UNSET") where datapoint.attributes["status.code"] == nil and instrumentation_scope.name == "spanmetricsconnector" and (datapoint.attributes["otel.status_code"] == "UNSET" or datapoint.attributes["otel.status_code"] == nil)'
 
   batch:
     send_batch_size: 1024
@@ -131,10 +145,8 @@ exporters:
   coralogix:
     domain: "${env:CORALOGIX_DOMAIN}"
     private_key: "${env:CORALOGIX_PRIVATE_KEY}"
-    # Fallbacks, used only when the attributes below are absent.
     application_name: "moh-hub-poc"
     subsystem_name: "unknown"
-    # Derive Coralogix application/subsystem from OTel resource attributes.
     application_name_attributes:
       - "service.namespace"
     subsystem_name_attributes:
@@ -148,37 +160,65 @@ exporters:
       initial_interval: 5s
       max_interval: 30s
 
-  # Uncomment while troubleshooting to print spans to the container log.
-  # debug:
-  #   verbosity: detailed
-
 connectors:
+  # Routes a copy of the trace stream into the db-metrics pipeline.
+  forward/db: {}
+
   # ===========================================================================
-  #  APM SERVICE METRICS  —  RED metrics derived from the spans themselves
+  #  APM SERVICE METRICS — calls_total / duration_ms_* (chart-verbatim)
   # ===========================================================================
-  #  Produces calls_total + duration histograms per service/operation, which is
-  #  what drives the APM latency, throughput and error-rate charts. Generated
-  #  locally from spans you are already sending, so it costs no extra spans.
+  #  namespace: "" is what makes the metric arrive as `calls_total` instead of
+  #  `traces_span_metrics_calls_total` — the APM UI queries the former.
   spanmetrics:
-    histogram:
-      explicit:
-        # Coralogix's recommended default buckets for ECS.
-        buckets: [1ms, 4ms, 10ms, 20ms, 50ms, 100ms, 200ms, 500ms, 1s, 2s, 5s]
-    # CUSTOMER: BE CAREFUL HERE. Every dimension multiplies the number of time
-    # series. These are all low-cardinality and safe.
-    # NEVER add a dimension whose value is unbounded -- and `hub.message_id` is
-    # a GUID per transaction, so adding it here would create one time series per
-    # request and blow up both cardinality and cost. Keep the GUID on SPANS
-    # (where it belongs) and off METRICS.
+    namespace: ""
+    aggregation_cardinality_limit: 100000
     dimensions:
-      - name: http.request.method
+      - name: http.method
+      - name: cgx.transaction
+      - name: cgx.transaction.root
+      - name: status_code
+      - name: db.namespace
+      - name: db.operation.name
+      - name: db.collection.name
+      - name: db.system
       - name: http.response.status_code
+      - name: rpc.grpc.status_code
+      - name: service.version
       - name: messaging.system
+    exclude_dimensions:
+      - collector.instance.id
+    histogram:
+      unit: ms
+      explicit:
+        buckets: [1ms, 4ms, 10ms, 20ms, 50ms, 100ms, 200ms, 500ms, 1s, 2s, 5s]
     metrics_expiration: 5m
+    metrics_flush_interval: 30s
     exemplars:
-      # Attaches example trace IDs to the metrics, so you can jump from a
-      # latency spike straight into a representative trace.
       enabled: true
+
+  # ===========================================================================
+  #  DATABASE CATALOG METRICS — db_calls_total / db_duration_ms_* (chart-verbatim)
+  # ===========================================================================
+  #  Fed only with database CLIENT spans (see traces/db pipeline). The `db`
+  #  namespace is what produces the db_-prefixed names the Database Catalog
+  #  queries.
+  spanmetrics/db:
+    namespace: db
+    aggregation_cardinality_limit: 100000
+    dimensions:
+      - name: db.namespace
+      - name: db.operation.name
+      - name: db.collection.name
+      - name: db.system
+      - name: service.version
+    exclude_dimensions:
+      - collector.instance.id
+    histogram:
+      unit: ms
+      explicit:
+        buckets: [1ms, 4ms, 10ms, 20ms, 50ms, 100ms, 200ms, 500ms, 1s, 2s, 5s]
+    metrics_expiration: 5m
+    metrics_flush_interval: 30s
 
 extensions:
   health_check:
@@ -187,19 +227,23 @@ extensions:
 service:
   extensions: [health_check]
   # NOTE: no tail_sampling / probabilistic_sampler anywhere in this file.
-  # 100% of spans are forwarded to Coralogix, as required for the POC.
+  # 100% of spans are forwarded to Coralogix.
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [memory_limiter, resourcedetection/ecs, transform/hub_message_id, coralogix, batch]
-      # Two destinations: Coralogix, and the spanmetrics connector which feeds
-      # the metrics pipeline below.
-      exporters: [coralogix, spanmetrics]
+      processors: [memory_limiter, resourcedetection/ecs, transform/hub_message_id, transform/semconv, groupbytrace/transactions, coralogix, batch]
+      # Four destinations: Coralogix itself, the APM spanmetrics connector,
+      # and (via forward/db) the db-metrics pipeline below.
+      exporters: [coralogix, spanmetrics, forward/db]
+    traces/db:
+      receivers: [forward/db]
+      processors: [filter/db_spanmetrics, transform/db, batch]
+      exporters: [spanmetrics/db]
     metrics:
-      # OTLP = the SDKs' own runtime/HTTP metrics.
-      # spanmetrics = the APM RED metrics derived from the traces above.
-      receivers: [otlp, spanmetrics]
-      processors: [memory_limiter, resourcedetection/ecs, batch]
+      # OTLP = the SDKs' own runtime metrics.
+      # spanmetrics + spanmetrics/db = the APM / Database Catalog metrics.
+      receivers: [otlp, spanmetrics, spanmetrics/db]
+      processors: [memory_limiter, resourcedetection/ecs, transform/spanmetrics, batch]
       exporters: [coralogix]
     logs:
       receivers: [otlp]
